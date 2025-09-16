@@ -58,6 +58,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     data_parallel_size: int = 1
     """Option to enable data parallelism"""
 
+    sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()

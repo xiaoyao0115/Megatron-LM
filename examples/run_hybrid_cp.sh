@@ -34,6 +34,7 @@ USE_FLASH_ATTN=0
 USE_FSDP=0
 USE_CUSTOM_FSDP=0
 PROFILE=0
+USE_MOCK_DATA=1
 
 # Remember to update model and job name if running in batch mode!!
 if [[ $BATCH -eq 0 ]]; then
@@ -106,6 +107,12 @@ if [[ $PROFILE -eq 1 ]]; then
     EXTRA_ARGS+="--profile --profile-step-start 7 --profile-step-end 8 "
 fi
 
+if [[ $USE_MOCK_DATA -eq 1 ]]; then
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":1024,\"mean_seq_len\":1536,\"lognormal_sigma\":1.1}'"
+else
+    EXTRA_ARGS+=" --data-path ${DATA_TRAIN} "
+fi
+
 # CHECKPOINT_DIR="/lustre/fsw/portfolios/llmservice/users/trintamaki/workspace/output/video_sft_stage2_qwen_2p5_7b_radio_research_cp_0429_tp2/checkpoints"
 TP=1
 EXTRA_ARGS+=" --ckpt-format torch_dist --use-distributed-optimizer "
@@ -152,7 +159,6 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 999999 \
-    --data-path ${DATA_TRAIN} \
     --save-interval 1000 \
     --save ${FINETUNE_DIR} \
     --load ${FINETUNE_DIR} \
