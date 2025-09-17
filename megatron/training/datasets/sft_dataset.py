@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import json
 
 import numpy as np
@@ -54,25 +54,26 @@ class MockSFTLowLevelDataset:
     seed: int = 0
     """The hard-coded random seed to use to set the NumPy RNG"""
 
-    size: int = 100000
-    """The hard-coded number of samples to generate"""
+    size: int = 1000000
+    """The hard-coded number of sequence to generate"""
     
-    # TODO(tailaim): This is to maintain consistency with the SFT dataset that uses real data. In the real dataset, an element in the low-level dataset often contains multiple dialogue turns (multiple sequences). So here, each element in the mock low-level dataset also contains num_sequence_per_sample sequences. This will be made more reasonable in the future.
+    # This is to maintain consistency with the SFT dataset that uses real data. In the real dataset, an element in the low-level dataset often contains multiple sequences. So here, each element in the mock low-level dataset also contains num_sequence_per_sample sequences. This will be made more reasonable in the future.
     
-    num_sequence_per_sample: int = 10
-    """The hard-coded number of sequences per sample to generate"""
+    max_num_sequence_per_sample: int = 100
+    """The hard-coded max number of sequences per sample to generate"""
 
     def __init__(self, config: Dict) -> None:
         np.random.seed(self.seed)
         # either choose to load sequence lengths from external file, or generate random sequence lengths
+        self.index_ranges = []
         
         assert "mode" in config, f"mode must be set, either 'file' or 'distribution'"
         
-        if "num_sequence_per_sample" in config:
-            self.num_sequence_per_sample = config["num_sequence_per_sample"]
+        if "max_num_sequence_per_sample" in config:
+            self.max_num_sequence_per_sample = config["max_num_sequence_per_sample"]
         
         if config["mode"] == "file":
-            self.sequence_lengths = np.array(pd.read_csv(config.sft_mock_seqlen_file_path)).flatten()
+            self.sequence_lengths = np.array(pd.read_csv(config["path"])).flatten()
             self.size = len(self.sequence_lengths)
         elif config["mode"] == "distribution":
             min_seq_len = config["min_seq_len"]
@@ -82,21 +83,32 @@ class MockSFTLowLevelDataset:
                 lognormal_sigma = config["lognormal_sigma"]
                 self.sequence_lengths = self.generate_lognormal_samples(self.size, mean_seq_len,lognormal_sigma, min_seq_len, max_seq_len)
             else:
-                raise ValueError(f"Unsupported sequence length distribution type {config["type"]}")
+                raise ValueError(f"Unsupported sequence length distribution type {config['type']}")
+        self.pack_index_ranges()
         
-    def generate_lognormal_samples(self, size, mean, sigma, min_seq_len=1, max_seq_len=4096):   
+    def pack_index_ranges(self):
+        idx_start = 0
+        while idx_start < self.size:
+            num_sequence = np.random.randint(5, self.max_num_sequence_per_sample+1)
+            idx_end = idx_start + num_sequence
+            if idx_end <= self.size:
+                self.index_ranges.append((idx_start,idx_end))
+            idx_start = idx_end
+        
+    def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
         mu = np.log(mean) - sigma**2 / 2
         samples = np.random.lognormal(mu, sigma, size)
         samples = np.clip(samples, min_seq_len, max_seq_len)
         return samples.astype(int)   
 
     def __len__(self) -> int:
-        return self.size
+        return len(self.index_ranges)
 
-    def __getitem__(self, idx: int) -> np.number:
+    def __getitem__(self, idx: int) -> List[np.ndarray]:
+        idx_start, idx_end = self.index_ranges[idx % len(self.index_ranges)]
         samples = []
-        for i in range(self.num_sequence_per_sample):
-            length = self.sequence_lengths[(idx *self.num_sequence_per_sample+i)  % self.size]
+        for i in range(idx_start, idx_end):
+            length = self.sequence_lengths[i]
             sample = np.int64(
                 np.concatenate([np.arange(length) + 1])
             )

@@ -34,7 +34,7 @@ USE_FLASH_ATTN=0
 USE_FSDP=0
 USE_CUSTOM_FSDP=0
 PROFILE=0
-USE_MOCK_DATA=1
+USE_MOCK_DATA=0
 
 # Remember to update model and job name if running in batch mode!!
 if [[ $BATCH -eq 0 ]]; then
@@ -108,6 +108,7 @@ if [[ $PROFILE -eq 1 ]]; then
 fi
 
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
     EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":1024,\"mean_seq_len\":1536,\"lognormal_sigma\":1.1}'"
 else
     EXTRA_ARGS+=" --data-path ${DATA_TRAIN} "
