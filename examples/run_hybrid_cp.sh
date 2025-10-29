@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH -A coreai_dlalgo_llm
+#SBATCH -A coreai_devtech_all
 # DFW: batch
 # OCI-NRT: batch_block1
 # OCI-IAD: batch_block1,batch_block3,batch_block4,backfill_block1,backfill_block2,backfill_block3,backfill_block4
@@ -34,7 +34,7 @@ USE_FLASH_ATTN=0
 USE_FSDP=0
 USE_CUSTOM_FSDP=0
 PROFILE=0
-USE_MOCK_DATA=0
+USE_MOCK_DATA=1
 
 # Remember to update model and job name if running in batch mode!!
 if [[ $BATCH -eq 0 ]]; then
@@ -45,8 +45,8 @@ else
     MODEL_NAME="interactive_hybrid_cp"
 fi
 
-WORKSPACE="/lustre/fsw/portfolios/coreai/users/pmannan/workspace"
-SOURCE=`pwd`
+WORKSPACE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm/logs"
+SOURCE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm"
 OUTPUT_BASE="${WORKSPACE}/output"
 OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}"
 
@@ -109,7 +109,7 @@ fi
 
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":1024,\"mean_seq_len\":1536,\"lognormal_sigma\":1.1}'"
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":8192,\"max_seq_len\":8192,\"mean_seq_len\":1536,\"lognormal_sigma\":1.1}'"
 else
     EXTRA_ARGS+=" --data-path ${DATA_TRAIN} "
 fi
@@ -126,6 +126,7 @@ OPTIONS=" \
     --disable-bias-linear \
     --sft \
     --tokenizer-type SFTTokenizer \
+    --legacy-tokenizer \
     --sft-tokenizer-prompt-format nemotron-h-aligned \
     --tokenizer-model /lustre/fsw/portfolios/llmservice/users/kezhik/images/Nemotron-H-4B-Instruct \
     --transformer-impl transformer_engine \
@@ -204,8 +205,9 @@ else
     DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
     srun -l --verbose \
-    --container-image /lustre/fsw/portfolios/coreai/users/pmannan/workspace/megatron_vlm_25.02_stage3-te_api.sqsh \
+    --container-image /lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-moe-scripts/mcore-moe-pytorch25.06.sqsh \
     --container-mounts "/lustre" \
+    --no-container-mount-home \
     --output=${LOGS_DIR}/%x_%j_$DATETIME.log \
     sh -c "${run_cmd}"
 
