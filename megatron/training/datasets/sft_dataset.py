@@ -322,8 +322,8 @@ class MockSFTDataset(SFTDataset):
             targets_list = targets.tolist()
 
             # Add EOD for mock data
-            tokens_list.append(eod)
-            targets_list.append(eod)
+            # tokens_list.append(eod)
+            # targets_list.append(eod)
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)

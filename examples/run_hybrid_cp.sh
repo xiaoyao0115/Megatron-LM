@@ -28,7 +28,7 @@ BATCH=$((1-$?))
 
 DEBUG=0
 USE_TILING=1
-USE_CP=1
+USE_CP=0
 USE_TE_CE=0
 USE_FLASH_ATTN=0
 USE_FSDP=0
@@ -59,7 +59,7 @@ export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/lustre/fs1/portfolios/llmservice/users/adithyare/sft/nano_v2_fake_packed_131072_10000_rndm//stage1_stage2_multiling_128k_seq_packed.empty_assist_filtered.shuf.jsonl"
 
-SEQ_LEN=131072 #131072 #81920 #65536
+SEQ_LEN=1024 #131072 #81920 #65536
 
 if [[ $DEBUG -eq 1 ]]; then
     MBZ=1
@@ -109,7 +109,7 @@ fi
 
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":8192,\"max_seq_len\":8192,\"mean_seq_len\":1536,\"lognormal_sigma\":1.1}'"
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":1024,\"mean_seq_len\":1024,\"lognormal_sigma\":1.1}'"
 else
     EXTRA_ARGS+=" --data-path ${DATA_TRAIN} "
 fi
@@ -182,7 +182,6 @@ OPTIONS=" \
     --attention-backend flash \
     --disable-gloo-process-groups \
     --use-dist-ckpt \
-    --hybrid-context-parallel \
     --max-seqlen-per-cp-rank 16384 \
 "
 # --hybrid-context-parallel \
