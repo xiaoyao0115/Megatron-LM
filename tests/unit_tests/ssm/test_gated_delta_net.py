@@ -32,6 +32,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
+from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
     import fla
@@ -138,71 +139,51 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
-    def test_jit_compiled_helpers(self):
-        import torch._dynamo
+    def test_gpu_forward_thd_correctness(self):
+        if self.sp_size > 1:
+            pytest.skip("Sequence parallel is not supported for this test case.")
 
-        gdn = self.gdn
-        batch = 2
-        seq_len = 16
+        atol, rtol = 3e-4, 3e-4
 
-        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
-
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
-        qkv = torch.randn(
-            batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        # Input shape
+        sequence_length = 32
+        micro_batch_size = 4
+        cu_seqlens = [0, 32, 64, 96, 128]
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
         )
-        gate = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            gdn.value_head_dim,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
-        beta = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
-        alpha = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
+        attention_mask_sbhd = None
+        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        attention_mask_thd = None
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
-        # Disable dynamo so coverage.py can trace through the method bodies,
-        # which are normally wrapped by @jit_fuser (torch.compile).
-        with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate_out, beta_out, alpha_out = (
-                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
-            )
-
-        assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
-        assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
-        assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        assert query.is_contiguous()
-        assert key.is_contiguous()
-        assert value.is_contiguous()
-
-        A_log_mock = torch.randn(
-            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        # THD format
+        output_thd, _ = self.gdn(
+            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
         )
-        dt_bias_mock = torch.randn(
-            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        # SBHD format
+        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
+        output_sbhd_T = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
+
+        rank = torch.distributed.get_rank()
+        assert output_thd.shape[0] == sub_sequence_length * micro_batch_size
+        assert output_thd.shape[1] == 1
+        assert output_thd.shape[2] == self.gdn.config.hidden_size
+        torch.testing.assert_close(
+            output_sbhd_T,
+            output_thd,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
         )
 
-        with torch._dynamo.config.patch(disable=True):
-            g, beta_sig = gdn._compute_g_and_beta(A_log_mock, dt_bias_mock, alpha, beta)
 
-        assert g.dtype == torch.float32
-        assert g.shape == alpha.shape
-        assert beta_sig.shape == beta.shape
-
-
+@pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
     [
@@ -214,7 +195,7 @@ class TestGatedDeltaNet:
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -255,4 +236,5 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         seed=123,
         sequence_length=256,
         micro_batch_size=4,
+        sequence_packing=sequence_packing,
     )
