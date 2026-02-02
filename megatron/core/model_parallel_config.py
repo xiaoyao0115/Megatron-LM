@@ -76,7 +76,6 @@ class ModelParallelConfig:
     """
     Scheduler for sequence packing and hybrid context parallel.
     default_sequence_packing: default sequence packing scheduler for sequence packing.
-    empty: empty scheduler for sequence packing.
     """
 
     sequence_packing: bool = False

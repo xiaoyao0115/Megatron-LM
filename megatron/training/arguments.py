@@ -805,15 +805,6 @@ def validate_args(args, defaults={}):
     if args.rl_use_sequence_packing:
         args.consumed_train_bins = 0
 
-    # Support for variable sequence lengths across batches/microbatches.
-    # set it if the dataloader supports generation of variable sequence lengths
-    # across batches/microbatches. Due to additional communication overhead
-    # during pipeline parallelism, it should not be set if sequence length
-    # is constant during training.
-    args.variable_seq_lengths = False
-    if args.sequence_packing:
-        args.variable_seq_lengths = True
-
     # Iteration-based training.
     if args.train_iters:
         # If we use iteration-based training, make sure the
@@ -972,15 +963,31 @@ def validate_args(args, defaults={}):
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
+    # Support for variable sequence lengths across batches/microbatches.
+    # set it if the dataloader supports generation of variable sequence lengths
+    # across batches/microbatches. Due to additional communication overhead
+    # during pipeline parallelism, it should not be set if sequence length
+    # is constant during training.
+    args.variable_seq_lengths = False
     if args.sequence_packing:
+        args.variable_seq_lengths = True
         assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
             f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
             f'must be >= single sequence max length ({args.seq_length})'
         # TODO(tailaim): add support for other dispatcher types
         print(f"Setting moe_token_dispatcher_type to alltoall for sft sequence packing with pipeline parallelism")
         args.moe_token_dispatcher_type = "alltoall"
-        if args.sequence_packing_scheduler is None:
-            args.sequence_packing_scheduler = 'default_sequence_packing'
+        if args.mock_data and args.sft_mock_dataset_config_json is None:
+            args.sft_mock_dataset_config_json = json.dumps(
+                {
+                    "mode": "distribution",
+                    "type": "lognormal",
+                    "min_seq_len": args.seq_length // 2,
+                    "max_seq_len": args.seq_length,
+                    "mean_seq_len": args.seq_length // 4 * 3,
+                    "lognormal_sigma": 1.1,
+                }
+            )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -2915,7 +2922,7 @@ def _add_distributed_args(parser):
                        help='Enables hybrid context parallel. This is used to balance the workload '
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default='default_sequence_packing', choices=['default_sequence_packing', 'empty'])
+    group.add_argument('--sequence-packing-scheduler', type=str, default='default_sequence_packing', choices=['default_sequence_packing'])
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

@@ -319,8 +319,13 @@ class HybridCPDataLoaderWrapper:
 class PackingScheduler(enum.Enum):
     """Enum for supported sequence packing algorithms."""
 
-    EMPTY = "empty"
     DEFAULT_SEQUENCE_PACKING = "default_sequence_packing"
+
+
+def _broadcast_tensor(item, src_rank, group) -> None:
+    """Broadcast a tensor from src_rank to all ranks in the group."""
+    if item is not None:
+        torch.distributed.broadcast(item, src_rank, group=group)
 
 
 class BaseScheduler:
@@ -344,6 +349,20 @@ class BaseScheduler:
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """schedule the samples into groups"""
+        raise NotImplementedError
+
+    def run(
+        self,
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+    ):
+        """Run the scheduler and return the new data_iterator."""
         raise NotImplementedError
 
     @staticmethod
@@ -395,12 +414,6 @@ class BaseScheduler:
         return global_id_seqlens, global_ids_this_rank
 
     @staticmethod
-    def _broadcast_tensor(item, src_rank, group):
-        """Broadcast a tensor from src_rank to all ranks in the group."""
-        if item is not None:
-            torch.distributed.broadcast(item, src_rank, group=group)
-
-    @staticmethod
     def _broadcast_to_pp_group(
         new_samples,
         num_micro_batches,
@@ -439,15 +452,15 @@ class BaseScheduler:
                 info_length_tensor = torch.tensor(
                     info_to_broadcast.shape[0], dtype=torch.int32
                 ).cuda()
-                BaseScheduler._broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-                BaseScheduler._broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
+                _broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
+                _broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
             else:
                 info_length_tensor = torch.tensor(0, dtype=torch.int32).cuda()
-                BaseScheduler._broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
+                _broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
                 info_to_broadcast = torch.empty(
                     info_length_tensor.item(), dtype=torch.float32
                 ).cuda()
-                BaseScheduler._broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
+                _broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
                 if pp_group.rank() != pp_group.size() - 1:
                     # middle PP stages receive the broadcasted info and unpack it
                     info_numpy = info_to_broadcast.cpu().numpy()
@@ -509,7 +522,7 @@ class BaseScheduler:
         else:
             info_to_broadcast = torch.zeros(num_values, dtype=dtype, device=dev)
 
-        BaseScheduler._broadcast_tensor(info_to_broadcast, src_rank, group)
+        _broadcast_tensor(info_to_broadcast, src_rank, group)
 
         if group.rank() != 0:
             values = info_to_broadcast.cpu().tolist()
@@ -788,72 +801,6 @@ class BaseScheduler:
         return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 
 
-class EmptyScheduler(BaseScheduler):
-    """
-    An empty scheduler that does nothing. Data iterator should return the packed samples and
-    corresponding cu_seqlens, etc.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def get_require_sample_keys(self):
-        """Return the required key of each batch."""
-        return [
-            "tokens",
-            "labels",
-            "loss_mask",
-            "position_ids",
-            "cu_seqlens",
-            "cu_seqlens_padded",
-            "max_seqlen",
-            "num_micro_batches_left",  # Number of microbatches left to be fetched.
-            "seqlen_sum_this_global_batch",  # Sum of seqlen in the global batch.
-            "seqlen_squared_sum_this_global_batch",  # Sum of seqlen^2 in the global batch.
-        ]
-
-    def get_groups_and_subsamples(self, sample_id_seqlens):
-        """
-        This scheduler does nothing.
-        """
-        pass
-
-    def run(
-        self,
-        data_iterator,
-        num_microbatches,
-        dp_group,
-        tp_group,
-        pp_group,
-        dp_cp_group,
-        dev,
-        config,
-    ):
-        """
-        Run the empty scheduling pipeline.
-
-        Steps:
-            1. Fetch the batch
-            2. Check required sample keys
-            3. get the number of microbatches
-            4. Return the new samples
-        """
-        batch = next(data_iterator)
-        # check if the batch contains all the required keys
-        for key in self.get_require_sample_keys():
-            assert key in batch[0], f"Batch missing required key {key}"
-        num_micro_batches = batch["num_micro_batches_left"] + 1
-        seqlen_sum_this_global_batch = batch["seqlen_sum_this_global_batch"]
-        seqlen_squared_sum_this_global_batch = batch["seqlen_squared_sum_this_global_batch"]
-        new_samples = [batch] + [next(data_iterator) for _ in range(num_micro_batches - 1)]
-        return (
-            new_samples,
-            num_micro_batches,
-            seqlen_sum_this_global_batch,
-            seqlen_squared_sum_this_global_batch,
-        )
-
-
 class DefaultSequencePackingScheduler(BaseScheduler):
     """Packs sequences in their original order until reaching the max limit of sequence length."""
 
@@ -1097,11 +1044,7 @@ class DefaultSequencePackingScheduler(BaseScheduler):
 
 
 def wrap_dataloader(
-    data_iterator,
-    config,
-    num_microbatches,
-    scheduler_type: Union[PackingScheduler, str],
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -1115,26 +1058,8 @@ def wrap_dataloader(
     """
 
     scheduler_map: Dict[PackingScheduler, Type[BaseScheduler]] = {
-        PackingScheduler.EMPTY: EmptyScheduler,
-        PackingScheduler.DEFAULT_SEQUENCE_PACKING: DefaultSequencePackingScheduler,
+        PackingScheduler.DEFAULT_SEQUENCE_PACKING: DefaultSequencePackingScheduler
     }
-
-    # Convert string to enum if needed
-    if isinstance(scheduler_type, str):
-        try:
-            scheduler_type = PackingScheduler[scheduler_type.upper()]
-        except KeyError:
-            available_scheduler = ", ".join([scheduler.name for scheduler in PackingScheduler])
-            raise ValueError(
-                f"Unknown packing scheduler: {scheduler_type}. "
-                f"Available schedulers: {available_scheduler}"
-            )
-
-    if scheduler_type not in scheduler_map:
-        available_scheduler = ", ".join([scheduler.name for scheduler in PackingScheduler])
-        raise ValueError(
-            f"Unknown scheduler: {scheduler}. " f"Available schedulers: {available_scheduler}"
-        )
 
     if pg_collection is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
@@ -1156,6 +1081,10 @@ def wrap_dataloader(
     dev = torch.cuda.current_device()
     dp_size = dp_group.size()
     cp_size = dp_cp_group.size() // dp_size
+
+    # Convert string to enum
+    scheduler_type = config.sequence_packing_scheduler
+    scheduler_type = PackingScheduler[scheduler_type.upper()]
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,
@@ -1199,13 +1128,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
     """
 
-    def _broadcast_to_tp_group(item):
-        if item is not None:
-            torch.distributed.broadcast(
-                item,
-                parallel_state.get_tensor_model_parallel_src_rank(),
-                group=parallel_state.get_tensor_model_parallel_group(),
-            )
+    tp_src_rank = parallel_state.get_tensor_model_parallel_src_rank()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
 
     is_tp_rank_0 = parallel_state.get_tensor_model_parallel_rank() == 0
     is_first_stage = parallel_state.is_pipeline_first_stage(
@@ -1262,7 +1186,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlen_size = torch.tensor(batch['cu_seqlens'].size(0), dtype=torch.int32, device=dev)
     else:
         cu_seqlen_size = torch.empty(1, dtype=torch.int32, device=dev)
-    _broadcast_to_tp_group(cu_seqlen_size)
+    _broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
     cu_seqlen_size = cu_seqlen_size.item()
 
     # Broadcast total_tokens because we need it to create placeholder for tokens, position_ids,
@@ -1272,7 +1196,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             total_tokens = torch.tensor(batch['tokens'].size(0), dtype=torch.int32, device=dev)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
-        _broadcast_to_tp_group(total_tokens)
+        _broadcast_tensor(total_tokens, tp_src_rank, tp_group)
         total_tokens = total_tokens.item()
 
     # Step1: Prepare "tokens", "position_ids" on all ranks.
@@ -1322,13 +1246,13 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['max_seqlen'] = torch.empty(1, dtype=torch.int32, device=dev)
 
     # Broadcast batch inside TP group.
-    _broadcast_to_tp_group(batch['tokens'])
-    _broadcast_to_tp_group(batch['position_ids'])
-    _broadcast_to_tp_group(batch['labels'])
-    _broadcast_to_tp_group(batch['loss_mask'])
-    _broadcast_to_tp_group(batch['cu_seqlens'])
-    _broadcast_to_tp_group(batch['cu_seqlens_padded'])
-    _broadcast_to_tp_group(batch['max_seqlen'])
+    _broadcast_tensor(batch['tokens'], tp_src_rank, tp_group)
+    _broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
+    _broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
+    _broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
+    _broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
+    _broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
+    _broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']

@@ -125,6 +125,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches
 )
+from megatron.core.datasets.data_schedule import wrap_dataloader
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -1467,24 +1468,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
+        if config.sequence_packing:
+            (
+                data_iterator,
+                num_microbatches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+            ) = wrap_dataloader(data_iterator, config, num_microbatches)
+        else:
+            # data_iterator unchanged
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = args.seq_length * args.micro_batch_size * args.data_parallel_size * num_microbatches
+            seqlen_squared_sum_this_global_batch = args.seq_length ** 2 * args.micro_batch_size * args.data_parallel_size * num_microbatches
+
         # Forward pass.
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
-
-    if args.sequence_packing:
-        seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = losses_reduced.pop()
-    else:
-        seqlen_squared_sum_this_global_batch = args.seq_length ** 2 * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
-        seqlen_sum_this_global_batch = args.seq_length * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:

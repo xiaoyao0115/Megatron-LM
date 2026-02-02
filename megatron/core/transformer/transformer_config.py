@@ -2007,6 +2007,13 @@ class TransformerConfig(ModelParallelConfig):
             if self.sequence_packing_scheduler is None:
                 self.sequence_packing_scheduler = 'default_sequence_packing'
 
+            supported_schedulers = ['default_sequence_packing']
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unknown scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
+
 
 @dataclass
 @experimental_api
