@@ -3548,14 +3548,16 @@ class AllGatherPipeline:
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
             with torch.cuda.stream(all_gather_stream):
+                # FIXME: Force async_ops=False to ensure proper synchronization
+                # _coalescing_manager with async_ops=True has a bug where work.wait() is a no-op
                 with _coalescing_manager(
-                    dp_group, async_ops=async_param_gather
+                    dp_group, async_ops=False
                 ) as coalescing_event:
                     for bucket_id in buckets:
                         # All-gather the module weights from each FSDP buffer shard
                         # into an allocated bucket containing unsharded weights.
                         self.async_bucket_gather(bucket_id, bwd)
-
+            
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
@@ -3570,12 +3572,20 @@ class AllGatherPipeline:
             for bucket_id in buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
 
+    def _wait_all_fsdp_streams(self):
+        """Ensure current stream waits for all FSDP streams."""
+        if self.ag_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.ag_stream)
+        if hasattr(self, 'outer_fsdp_group_param_gather_stream') and self.outer_fsdp_group_param_gather_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_param_gather_stream)
+
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
         """Wait for the bucket to be ready."""
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
         if self.bucket_status[bucket_key] == BucketStatus.READY_TO_USE:
-            # Already ready to use.
+            # Already ready to use, but still need to wait for streams.
+            self._wait_all_fsdp_streams()
             return
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
             if empty_ok:
@@ -3588,6 +3598,8 @@ class AllGatherPipeline:
         param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(bucket_key)
         param_gather_event.wait()
         mark_bucket_ready_to_use()
+        # Ensure current stream waits for all FSDP streams to complete all operations
+        self._wait_all_fsdp_streams()
 
     @torch.no_grad()
     def release_bucket(self, bucket_id, bwd):

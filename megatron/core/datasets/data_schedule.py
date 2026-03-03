@@ -1009,16 +1009,21 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         sum_seqlen = 0
         single_microbatch = []
 
+        #debugmtl
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
-                single_microbatch.append(i)
-                sum_seqlen += sample_id_seqlens[i][1]
-            else:
-                packed_id_groups.append(single_microbatch)
-                single_microbatch = [i]
-                sum_seqlen = sample_id_seqlens[i][1]
-        if len(single_microbatch) > 0:
+            single_microbatch = [i]
             packed_id_groups.append(single_microbatch)
+
+        # for i in range(len(sample_id_seqlens)):
+        #     if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+        #         single_microbatch.append(i)
+        #         sum_seqlen += sample_id_seqlens[i][1]
+        #     else:
+        #         packed_id_groups.append(single_microbatch)
+        #         single_microbatch = [i]
+        #         sum_seqlen = sample_id_seqlens[i][1]
+        # if len(single_microbatch) > 0:
+        #     packed_id_groups.append(single_microbatch)
 
         # we want the number of packed sequences to be multiple of dp_size
         # so we move few samples from previous microbatch

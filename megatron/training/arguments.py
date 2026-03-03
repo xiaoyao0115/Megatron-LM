@@ -2915,12 +2915,6 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
-    group.add_argument('--hierarchical-context-parallel-sizes', nargs='+', type=int, default=None,
-                       help='Degrees of the hierarchical context parallelism. Users should '
-                       'provide a list to specify the sizes for different levels. '
-                       '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
-                       'forms the first level of cp groups and the cp ranks with the same odevity '
-                       'forms the second level of cp groups.')
     group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
                        help='Maximum sequence length per CP rank. This is used to calculate the '
                        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
@@ -2928,18 +2922,7 @@ def _add_distributed_args(parser):
                        help='Enables hybrid context parallel. This is used to balance the workload '
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--min-hybrid-context-parallel-size', type=int, default=1,
-                        help='Minimum size of the hybrid context parallel groups.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
-                        choices=['default_hybrid_cp', 'empty_scheduler_with_packing', 'empty_scheduler_no_packing', 'naive_sequence_packing'],
-                        help='Scheduler for sequence packing and hybrid context parallel. '
-                        'naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this '
-                        'is just for comparison with default Hybrid-CP scheduler, not recommended for production) '
-                        'default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore. '
-                        'empty_scheduler_with_packing: scheduling is already handled by the data sampler, '
-                        'this scheduler only performs packing. '
-                        'empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler, '
-                        'this scheduler only returns the batch.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default='default_sequence_packing', choices=['default_sequence_packing'])
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

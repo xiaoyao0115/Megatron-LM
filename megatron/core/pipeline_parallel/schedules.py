@@ -555,6 +555,9 @@ def forward_backward_no_pipelining(
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
+    #debugmtl
+    forward_only = True
+
     if pg_collection is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
@@ -644,48 +647,50 @@ def forward_backward_no_pipelining(
             partial(check_first_val_step, first_val_step, forward_only),
         )
     else:
-        with no_sync_func():
-            for i in range(num_microbatches - 1):
-                output_tensor, num_tokens = forward_step(
-                    forward_step_func,
-                    data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    pg_collection.cp.size(),
-                    collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                    current_microbatch=i,
-                )
-                total_num_tokens += num_tokens
-                if not forward_only:
-                    backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+        #debugmtl
+        with torch.no_grad():
+            with no_sync_func():
+                for i in range(num_microbatches - 1):
+                    output_tensor, num_tokens = forward_step(
+                        forward_step_func,
+                        data_iterator,
+                        model,
+                        num_microbatches,
+                        input_tensor,
+                        forward_data_store,
+                        config,
+                        pg_collection.cp.size(),
+                        collect_non_loss_data,
+                        is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                        current_microbatch=i,
                     )
-        # Run computation for last microbatch out of context handler (want to
-        # synchronize gradients).
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            pg_collection.cp.size(),
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, num_microbatches == 1
-            ),
-            current_microbatch=num_microbatches - 1,
-        )
+                    total_num_tokens += num_tokens
+                    if not forward_only:
+                        backward_step(
+                            input_tensor, output_tensor, output_tensor_grad, model_type, config
+                        )
+            # Run computation for last microbatch out of context handler (want to
+            # synchronize gradients).
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                pg_collection.cp.size(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, num_microbatches == 1
+                ),
+                current_microbatch=num_microbatches - 1,
+            )
 
-        total_num_tokens += num_tokens
+            total_num_tokens += num_tokens
 
-        if not forward_only:
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            if not forward_only:
+                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -706,7 +711,7 @@ def forward_backward_no_pipelining(
     ):
         create_cudagraphs()
 
-    if config.sequence_packing and not forward_only:
+    if config.sequence_packing:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )
