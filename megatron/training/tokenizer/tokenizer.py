@@ -190,6 +190,11 @@ class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
     def pad(self):
         return self._tokenizer.pad_token_id
 
+    @property
+    def force_eod(self):
+        """To force an EOD at the end of every data sample in SFT."""
+        return True
+
 
 class _BertWordPieceTokenizer(MegatronLegacyTokenizer):
     """Original BERT wordpiece tokenizer."""

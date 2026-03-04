@@ -1499,6 +1499,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    # Zero out all gradients for perf benchmarking (bypass broken backward from fla)
+    if args.zero_grad_before_optimizer:
+        for model_chunk in model:
+            for param in model_chunk.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+                if hasattr(param, 'main_grad') and param.main_grad is not None:
+                    param.main_grad.zero_()
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)

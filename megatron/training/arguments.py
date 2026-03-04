@@ -2238,6 +2238,9 @@ def _add_training_args(parser):
     group.add_argument('--no-check-for-nan-in-loss-and-grad', action='store_false',
                        help='Check for NaNs in loss and grad',
                        dest='check_for_nan_in_loss_and_grad')
+    group.add_argument('--zero-grad-before-optimizer', action='store_true', default=False,
+                       help='Zero out all gradients before optimizer step. '
+                       'Useful for perf benchmarking when backward produces NaN gradients.')
     group.add_argument('--check-for-spiky-loss', action='store_true',
                        help='Check for spiky loss',
                        dest='check_for_spiky_loss')
