@@ -471,7 +471,7 @@ def num_floating_point_operations(args, num_total_tokens_this_global_batch, sequ
                         + args.hidden_size
                         * v_dim
                     )
-                )
+                ) * num_total_tokens_this_global_batch
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
