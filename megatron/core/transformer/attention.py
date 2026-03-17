@@ -1050,6 +1050,7 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
+            self.pg_collection.cp = _orig_cp_group
             return output, bias
 
         if (
