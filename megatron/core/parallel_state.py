@@ -945,6 +945,7 @@ def initialize_model_parallel(
     if dynamic_context_parallel:
         # TODO: Are gloo groups needed for Dynamic CP?
         global _DYNAMIC_DP_CP_GROUPS
+        data_parallel_size_with_cp = data_parallel_size * context_parallel_size
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
             assert (
                 len(ranks_with_cp) % 2 == 0
@@ -955,17 +956,18 @@ def initialize_model_parallel(
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
-                    max_cp_size=context_parallel_size,
+                    # Dynamic CP scheduling can temporarily form larger DPxCP groups
+                    # than context_parallel_size when filling idle ranks.
+                    max_cp_size=len(ranks_with_cp),
                 )
             )
 
-        data_parallel_size_with_cp = data_parallel_size * context_parallel_size
         group_sizes = [
             2**i for i in range(int(log2(data_parallel_size_with_cp)))
-            if 2**i >= min_dynamic_context_parallel_size and 2**i <= context_parallel_size
+            if 2**i >= min_dynamic_context_parallel_size and 2**i <= data_parallel_size_with_cp
         ]
-        if context_parallel_size == data_parallel_size_with_cp:
-            group_sizes.append(context_parallel_size)
+        if data_parallel_size_with_cp >= min_dynamic_context_parallel_size:
+            group_sizes.append(data_parallel_size_with_cp)
         for group_size in group_sizes:
             group = get_dynamic_data_context_parallel_groups(group_size=group_size)
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])

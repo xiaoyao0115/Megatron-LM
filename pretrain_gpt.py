@@ -92,6 +92,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
+    local_cp_size = batch.pop('local_cp_size', None)
 
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism

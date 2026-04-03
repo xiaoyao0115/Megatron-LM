@@ -872,19 +872,23 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        # Use dynamic CP group if available, otherwise fall back to static CP group.
+        cp_group = self.cp_group
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            cp_group = packed_seq_params.cp_group
+
         input_ids, _ = roll_tensor(
             input_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
+            cp_group=cp_group,
             packed_seq_params=packed_seq_params,
         )
         position_ids, _ = roll_tensor(
             position_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
+            cp_group=cp_group,
             packed_seq_params=packed_seq_params,
         )
         # embedding

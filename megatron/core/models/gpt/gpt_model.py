@@ -615,6 +615,9 @@ class GPTModel(LanguageModule):
             return hidden_states
 
         if self.config.mtp_num_layers:
+            mtp_cp_group = self.pg_collection.cp
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                mtp_cp_group = packed_seq_params.cp_group
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,
@@ -625,7 +628,7 @@ class GPTModel(LanguageModule):
                 is_training=self.training,
                 compute_language_model_loss=self.compute_language_model_loss,
                 config=self.config,
-                cp_group=self.pg_collection.cp,
+                cp_group=mtp_cp_group,
                 packed_seq_params=packed_seq_params,
             )
         sequence_parallel_override = False

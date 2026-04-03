@@ -342,7 +342,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
         self.min_cp_size = min_cp_size
-        self.max_cp_size = max_cp_size if max_cp_size is not None else self.cp_size
+        self.max_cp_size = max_cp_size if max_cp_size is not None else self.total_hdp_gpus
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -434,7 +434,7 @@ def wrap_data_iterator(
     scheduler_kwargs = {}
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
-        scheduler_kwargs['max_cp_size'] = cp_size
+        scheduler_kwargs['max_cp_size'] = dp_size * cp_size
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,
