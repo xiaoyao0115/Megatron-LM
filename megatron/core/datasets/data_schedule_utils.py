@@ -775,6 +775,321 @@ def next_hdp_group(
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
+def next_hdp_group_v2(
+    sample_seqlens: List[Tuple[int, int]],
+    total_gpus: int,
+    max_seq_len_per_rank: int,
+    min_cp_size: int = 1,
+    delta: float = 0.05,
+    global_target: Optional[float] = None,
+) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
+    """V2-pack3 DCP scheduler: V2-orig 全机制 + packing-aware cap.
+
+    直接 port v2orig_reference_impl.py (claude-data/2026-04-16) 的 V2-orig 算法,
+    唯一改动: cap 公式从 tall²/cp_min × (1+δ) 改成 tall × MSLPR × (1+δ).
+
+    V2-orig 关键机制 (相比之前的 V2-pack / V2-pack2 保留):
+    - 无 V1 bucket, 纯 desc by L 遍历
+    - 无 slack 终止, 遍历 remaining 直到 cap 拒绝或放完
+    - Step 1: 第一条 tall seq 强制 cp_min 放 new group (不参与 argmin)
+    - Step 2: 剩余 seq 循环 cp ∈ {cp_min, 2·cp_min, ..., total_gpus}
+      - Option A: existing groups with sz == cp (严格相等, 每个 cp 一次)
+      - Option B: new group at this cp
+      - argmin proj_max across all candidates
+      - cap 作为 hard 过滤
+      - 无 valid -> leftover
+    - Step 3: fill_empty 扩展 smallest group (V1 机制)
+
+    cap 创新 (vs V2-orig):
+      V2-orig cap = tall²/cp_min × 1.1 在短 seq mb (tall << MSLPR) 下过紧,
+      导致 m=1536 σ=1.8 下 -27% regression.
+      V2-pack3 cap = tall × MSLPR × 1.05 是 per-rank workload 的真正上界
+      (tall pole 独占 cp_min 个 rank, 其他 seq 填剩余 MSLPR-tall/cp_min tokens,
+       合计 tall × MSLPR). 在长 seq mb 下 ≈ V2-orig (tall/cp_min ≈ MSLPR),
+       在短 seq mb 下宽 MSLPR/tall 倍, 修复灾难.
+
+    global_target 参数历史遗留, 忽略.
+    """
+    if not sample_seqlens:
+        return (
+            [[] for _ in range(total_gpus)],
+            [],
+            [0.0 for _ in range(total_gpus)],
+            [[] for _ in range(total_gpus)],
+        )
+
+    def cp_min_fn(L: int) -> int:
+        return dcp_gpus_needed(L, max_seq_len_per_rank, min_cp_size)
+
+    def wl(L: int, cp: int) -> float:
+        return (L * L) / cp
+
+    # Sorted desc by L (V2-orig style, 不用 bucket)
+    sample_seqlens = sorted(sample_seqlens, key=lambda x: x[1], reverse=True)
+
+    # V2-pack3: packing-aware cap = tall × MSLPR × (1+δ)
+    local_tall = sample_seqlens[0][1]
+    cap = float(local_tall) * float(max_seq_len_per_rank) * (1.0 + delta)
+
+    micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
+    exec_times: List[float] = [0.0] * total_gpus
+    sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
+    packing_sequence_len: dict = {}
+    gpu_group_id: List[Optional[int]] = [None] * total_gpus
+    group_members: dict = {}
+    group_size: dict = {}
+    next_gid = 0
+
+    # Step 1: tall pole 强制 cp_min, 占 rank [0..cp0-1]
+    sid0, L0 = sample_seqlens[0]
+    cp0 = cp_min_fn(L0)
+    gid0 = next_gid
+    next_gid += 1
+    members0 = list(range(cp0))
+    group_members[gid0] = members0
+    group_size[gid0] = cp0
+    packing_sequence_len[gid0] = L0 / cp0
+    per_gpu0 = wl(L0, cp0)
+    for r in members0:
+        gpu_group_id[r] = gid0
+        micro_batches[r].append(L0)
+        exec_times[r] += per_gpu0
+        sample_ids_per_gpu[r].append(sid0)
+
+    remaining = list(sample_seqlens[1:])
+    leftovers: List[Tuple[int, int]] = []
+
+    # Step 2: 逐条 desc 处理, 循环 cp 找 argmin proj_max
+    idx = 0
+    while idx < len(remaining):
+        sid, seq_len = remaining[idx]
+        cp_lo = cp_min_fn(seq_len)
+
+        best = None  # (proj_max, cp, action, gid_or_None, members_or_None)
+        cp = cp_lo
+        while cp <= total_gpus:
+            per_gpu_cost = wl(seq_len, cp)
+
+            # Option A: add to existing group of size == cp
+            for gid_c, sz in list(group_size.items()):
+                if sz != cp:
+                    continue
+                if packing_sequence_len.get(gid_c, 0) + seq_len / cp > max_seq_len_per_rank:
+                    continue
+                members_c = group_members[gid_c]
+                proj_max = 0.0
+                m_set = set(members_c)
+                for r_i, t in enumerate(exec_times):
+                    nt = t + per_gpu_cost if r_i in m_set else t
+                    if nt > proj_max:
+                        proj_max = nt
+                if proj_max > cap:
+                    continue
+                if best is None or proj_max < best[0]:
+                    best = (proj_max, cp, 'add', gid_c, None)
+
+            # Option B: new group from free ranks, size cp
+            free = [r for r, g in enumerate(gpu_group_id) if g is None]
+            if len(free) >= cp:
+                chosen = sorted(free, key=lambda r: exec_times[r])[:cp]
+                proj_max = 0.0
+                ch_set = set(chosen)
+                for r_i, t in enumerate(exec_times):
+                    nt = t + per_gpu_cost if r_i in ch_set else t
+                    if nt > proj_max:
+                        proj_max = nt
+                if proj_max <= cap:
+                    if best is None or proj_max < best[0]:
+                        best = (proj_max, cp, 'new', None, chosen)
+            cp *= 2
+
+        if best is None:
+            leftovers.append((sid, seq_len))
+            idx += 1
+            continue
+
+        _, cp_sel, action, gid_to, members_or_none = best
+        per_gpu_cost = wl(seq_len, cp_sel)
+        if action == 'add':
+            members = group_members[gid_to]
+            packing_sequence_len[gid_to] += seq_len / cp_sel
+            for r in members:
+                micro_batches[r].append(seq_len)
+                exec_times[r] += per_gpu_cost
+                sample_ids_per_gpu[r].append(sid)
+        else:
+            members = members_or_none
+            g = next_gid
+            next_gid += 1
+            group_members[g] = members
+            group_size[g] = cp_sel
+            packing_sequence_len[g] = seq_len / cp_sel
+            for r in members:
+                gpu_group_id[r] = g
+                micro_batches[r].append(seq_len)
+                exec_times[r] += per_gpu_cost
+                sample_ids_per_gpu[r].append(sid)
+        idx += 1
+
+    # 7) V1's fill_empty_gpus: expand smallest group, push others right
+    def _fill_empty():
+        nonlocal micro_batches, exec_times, sample_ids_per_gpu
+        empty = [i for i in range(total_gpus) if not micro_batches[i]]
+        if not empty:
+            return False
+        existing_sizes = set(group_size.values())
+        if not existing_sizes:
+            return False
+        min_size = min(existing_sizes)
+        next_power = min(min_size * 2, total_gpus)
+        for gid, sz in list(group_size.items()):
+            if sz != min_size:
+                continue
+            members = group_members[gid]
+            step = next_power - min_size
+            start, end = members[0], members[-1]
+            empty_gpu = [i for i, mb in enumerate(micro_batches) if not mb][0]
+            if end + 1 > empty_gpu:
+                continue
+            if end + step >= total_gpus:
+                continue
+            work_to_push = micro_batches[end + 1 : empty_gpu]
+            exec_push = exec_times[end + 1 : empty_gpu]
+            sids_push = sample_ids_per_gpu[end + 1 : empty_gpu]
+            new_mb: List[List[int]] = [[]] * total_gpus
+            new_et: List[float] = [0.0] * total_gpus
+            new_sids: List[List[int]] = [[]] * total_gpus
+            for i in range(start):
+                new_mb[i] = micro_batches[i]
+                new_et[i] = exec_times[i]
+                new_sids[i] = sample_ids_per_gpu[i]
+            for i in range(start, end + step + 1):
+                new_mb[i] = micro_batches[end]
+                new_et[i] = sum(wl(ll, next_power) for ll in micro_batches[end])
+                new_sids[i] = sample_ids_per_gpu[end]
+            for i, work in enumerate(work_to_push):
+                new_mb[end + step + 1 + i] = work
+                new_et[end + step + 1 + i] = exec_push[i]
+                new_sids[end + step + 1 + i] = sids_push[i]
+            group_size[gid] = next_power
+            group_members[gid] = list(range(start, end + step + 1))
+            for other_gid in list(group_size.keys()):
+                if other_gid == gid:
+                    continue
+                if min(group_members[other_gid]) > end:
+                    group_members[other_gid] = [
+                        x + step for x in group_members[other_gid]
+                    ]
+            micro_batches = new_mb
+            exec_times = new_et
+            sample_ids_per_gpu = new_sids
+            return True
+        return False
+
+    while any(not mb for mb in micro_batches):
+        if not _fill_empty():
+            break
+
+    # DCP_SCHEDULER_DEBUG=1 开启 debug, =2 则连带打每 group 明细.
+    import os as _os
+    _dbg = int(_os.environ.get("DCP_SCHEDULER_DEBUG", "0"))
+    if _dbg:
+        _is_rank0 = True
+        try:
+            import torch.distributed as _dist
+            # 严格 is True: 生产下 is_initialized() 返回 python bool; mock 环境下
+            # 返回 MagicMock, 不等于 True, 保持 _is_rank0=True 让打印照常.
+            if _dist.is_initialized() is True:
+                _is_rank0 = (_dist.get_rank() == 0)
+        except Exception:
+            pass
+        if _is_rank0:
+            _n_in = len(sample_seqlens)
+            _cp_histo = {}
+            for _sz in group_size.values():
+                _cp_histo[_sz] = _cp_histo.get(_sz, 0) + 1
+            _emax = max(exec_times) if exec_times else 0.0
+            _emin = min(exec_times) if exec_times else 0.0
+            _emean = (sum(exec_times) / len(exec_times)) if exec_times else 0.0
+            _util = (_emin / _emax * 100.0) if _emax > 0 else 0.0
+            _tall = max((L for _, L in sample_seqlens), default=0)
+            _cap_str = f"{cap:.3e}" if cap < float('inf') else "inf"
+            print(
+                f"[DCP-PACK] mb-done tall={_tall} cap={_cap_str} "
+                f"n_in={_n_in} placed_groups={len(group_size)} leftover={len(leftovers)} "
+                f"groups_by_cp={_cp_histo} "
+                f"et_max={_emax/1e6:.2f}M et_min={_emin/1e6:.2f}M et_mean={_emean/1e6:.2f}M "
+                f"util={_util:.1f}%",
+                flush=True,
+            )
+            if _dbg >= 2:
+                for _gid, _sz in group_size.items():
+                    _members = group_members[_gid]
+                    _pack = packing_sequence_len.get(_gid, 0)
+                    _rank0_et = exec_times[_members[0]] if _members else 0.0
+                    _seqs = micro_batches[_members[0]] if _members else []
+                    print(
+                        f"  [group {_gid}] cp={_sz} ranks=[{_members[0]}..{_members[-1]}] "
+                        f"pack_len={_pack:.0f}/{max_seq_len_per_rank} "
+                        f"rank_et={_rank0_et/1e6:.2f}M seqs={_seqs}",
+                        flush=True,
+                    )
+
+    return micro_batches, leftovers, exec_times, sample_ids_per_gpu
+
+
+def reorder_microbatches_for_pp(
+    sample_id_groups: List[List[List[int]]],
+    sample_id_to_seqlen: dict,
+    exec_times_per_mb: Optional[List[List[float]]] = None,
+) -> List[List[List[int]]]:
+    """Reorder microbatches so lightest are at head and tail (PP bubble reduction).
+
+    Bitonic arrangement: sorted asc → [L0, L1, L2, L3, L4] becomes [L0, L2, L4, L3, L1].
+    Heaviest ends up in the middle; lightest at the edges.
+
+    Weight = critical path of each microbatch.
+    - If ``exec_times_per_mb`` is given (scheduler-provided per-rank cumulative
+      workload), weight = max(exec_times[r]) over ranks — this is the real PP bubble
+      driver (max single-rank time, not total work).
+    - Fallback to sum of seq_len**2 (only correct when all seqs in a mb use the
+      same cp_size, which is not generally true in DCP).
+    """
+    n = len(sample_id_groups)
+    if n <= 2:
+        return sample_id_groups
+
+    if exec_times_per_mb is not None and len(exec_times_per_mb) == n:
+        weights = [max(et) if et else 0.0 for et in exec_times_per_mb]
+    else:
+        weights = []
+        for mb in sample_id_groups:
+            seen = set()
+            w = 0
+            for sub in mb:
+                for sid in sub:
+                    if sid not in seen:
+                        seen.add(sid)
+                        L = sample_id_to_seqlen.get(int(sid), 0)
+                        w += L * L
+            weights.append(w)
+
+    sorted_idx = sorted(range(n), key=lambda i: weights[i])
+    result_order = [None] * n
+    left, right = 0, n - 1
+    toggle = 0
+    for k in range(n):
+        src = sorted_idx[k]
+        if toggle == 0:
+            result_order[left] = src
+            left += 1
+        else:
+            result_order[right] = src
+            right -= 1
+        toggle ^= 1
+    return [sample_id_groups[i] for i in result_order]
+
+
 def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_stage: int) -> List:
     """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
 

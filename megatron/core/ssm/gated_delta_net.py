@@ -451,22 +451,26 @@ class GatedDeltaNet(MegatronModule):
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
+            # Pad sequence length to _CONV_PAD_ALIGNMENT boundary to reduce Triton
+            # autotune recompilation.  FLA's causal_conv1d includes total_tokens in
+            # its autotune key; dynamic CP causes token counts to vary per microbatch,
+            # triggering expensive re-autotuning.  Padding collapses the variation
+            # into fewer buckets.  Only needed for packed sequences (cu_seqlens_q is
+            # not None); without packing the token count is fixed across microbatches.
             _orig_seq = qkv.shape[1]
-            _pad_n = (-_orig_seq % _CONV_PAD_ALIGNMENT)
-            _conv_input = qkv
-            _conv_cu_seqlens = cu_seqlens_q
+            _pad_n = (-_orig_seq) % _CONV_PAD_ALIGNMENT if cu_seqlens_q is not None else 0
             if _pad_n > 0:
-                _conv_input = torch.nn.functional.pad(qkv, (0, 0, 0, _pad_n))
-                _conv_cu_seqlens = cu_seqlens_q.clone()
-                _conv_cu_seqlens[-1] += _pad_n
+                qkv = torch.nn.functional.pad(qkv, (0, 0, 0, _pad_n))
+                cu_seqlens_q = cu_seqlens_q.clone()
+                cu_seqlens_q[-1] += _pad_n
             qkv, _ = causal_conv1d(
-                x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
+                x=qkv,
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=_conv_cu_seqlens,
+                cu_seqlens=cu_seqlens_q,
             )
             if _pad_n > 0:
                 qkv = qkv[:, :_orig_seq, :]

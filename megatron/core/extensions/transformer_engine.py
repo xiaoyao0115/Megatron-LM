@@ -2643,16 +2643,30 @@ try:
     ):
         """Get CPU offload context and sync function."""
         if is_te_min_version("2.5.0"):
-            # Enables the additional double buffering switch for activations during LLM training
-            context, sync_func = _get_cpu_offload_context(
-                enabled,
-                num_layers,
-                model_layers,
-                activation_offloading,
-                weight_offloading,
-                double_buffering,
-                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
-            )
+            # Enables the additional double buffering switch for activations during LLM training.
+            # TE 2.10 在本容器里没有 `retain_pinned_cpu_buffers` 这个关键字参数,
+            # 我们没有打开 CPU offload, 所以先尝试带 kwarg 调用, 失败就 fallback 到不带.
+            try:
+                context, sync_func = _get_cpu_offload_context(
+                    enabled,
+                    num_layers,
+                    model_layers,
+                    activation_offloading,
+                    weight_offloading,
+                    double_buffering,
+                    retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
+                )
+            except TypeError as _e:
+                if 'retain_pinned_cpu_buffers' not in str(_e):
+                    raise
+                context, sync_func = _get_cpu_offload_context(
+                    enabled,
+                    num_layers,
+                    model_layers,
+                    activation_offloading,
+                    weight_offloading,
+                    double_buffering,
+                )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
                 enabled, num_layers, model_layers, activation_offloading, weight_offloading

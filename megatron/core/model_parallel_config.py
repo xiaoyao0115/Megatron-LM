@@ -87,6 +87,22 @@ class ModelParallelConfig:
     default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
+    dcp_scheduler_v2: bool = False
+    """If True, use the flexible-cp + max-objective V2 scheduler for default_dynamic_cp.
+    V2 lets short sequences use a larger cp_size (up to total DPxCP ranks) to better
+    balance critical-path workload across ranks, and uses max(exec_times) (bounded by
+    the tall-pole sequence's per-GPU workload) as the objective instead of variance.
+    """
+
+    dcp_pp_reorder: bool = False
+    """If True, reorder microbatches so that light-workload microbatches sit at head
+    and tail of the global batch. Designed to shrink PP warmup/cooldown bubbles
+    (which cannot be overlapped).
+    """
+
+    dcp_v2_delta: float = 0.05
+    """Slack tolerance for V2 scheduler, matches V1's ``delta`` (max-min <= delta*max)."""
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
