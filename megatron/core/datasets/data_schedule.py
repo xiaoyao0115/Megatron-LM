@@ -655,15 +655,16 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
     cu_seqlen_size = cu_seqlen_size.item()
 
-    # Broadcast total_tokens because padding_mask is prepared on every PP stage.
-    # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
+    # Broadcast the CP-local token count because padding_mask is prepared on
+    # every PP stage. Tokens/labels/loss_mask/position_ids use the same local
+    # length on stages that own them.
     if is_tp_rank_0:
-        # Under VPP, the last PP stage has labels but no tokens, so derive
-        # total_tokens from cu_seqlens_padded, which is present on every
-        # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
-        # by cp_size to match the already CP-sliced sequence tensors.
-        cp_world = cp_group.size()
-        total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
+        # THD CP partitioning is index based and is not guaranteed to be an
+        # equal split of cu_seqlens_padded[-1]. Use the already CP-sliced
+        # padding_mask length so metadata-only PP/VPP stages match hidden_states.
+        total_tokens = torch.tensor(
+            [batch['padding_mask'].numel()], dtype=torch.int32, device=dev
+        )
     else:
         total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
     broadcast_tensor(total_tokens, tp_src_rank, tp_group)
