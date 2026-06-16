@@ -1418,7 +1418,17 @@ def pretrain(
 
         iteration = args.iteration
 
-    if args.do_valid:
+    skip_packed_varlen_eval = (
+        getattr(args, "use_varlen_dataset", False)
+        and not getattr(args, "varlen_sbhd_validation", False)
+    )
+    if skip_packed_varlen_eval and (args.do_valid or args.do_test):
+        print_rank_0(
+            "skipping validation/test for packed varlen dataset; "
+            "sequence-packing metadata is only available on the train iterator"
+        )
+
+    if args.do_valid and not skip_packed_varlen_eval:
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:
             rl_eval_model = model
@@ -1448,7 +1458,7 @@ def pretrain(
                 non_loss_data_func=non_loss_data_func
             )
 
-    if args.do_test:
+    if args.do_test and not skip_packed_varlen_eval:
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
@@ -3743,7 +3753,12 @@ def train(
         is_first_iteration = False
 
         # Evaluation.
+        skip_packed_varlen_eval = (
+            getattr(args, "use_varlen_dataset", False)
+            and not getattr(args, "varlen_sbhd_validation", False)
+        )
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid \
+                and not skip_packed_varlen_eval \
                 and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
             if args.log_energy:
                 energy_monitor.pause()
