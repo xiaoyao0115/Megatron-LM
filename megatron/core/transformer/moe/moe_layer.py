@@ -713,7 +713,19 @@ class MoELayer(BaseMoELayer):
         # padding_mask arrives as [bsz, seq_length] but may need SP scatter when
         # hidden_states is already TP-scattered (seq_length / TP).
         if padding_mask is not None and padding_mask.shape[1] != hidden_states.shape[0]:
-            if (
+            if padding_mask.shape[1] < hidden_states.shape[0]:
+                pad_shape = list(padding_mask.shape)
+                pad_shape[1] = hidden_states.shape[0] - padding_mask.shape[1]
+                padding_mask = torch.cat(
+                    (
+                        padding_mask,
+                        torch.ones(
+                            pad_shape, dtype=padding_mask.dtype, device=padding_mask.device
+                        ),
+                    ),
+                    dim=1,
+                )
+            elif (
                 self.config.sequence_parallel
                 and padding_mask.shape[1] % self.config.tensor_model_parallel_size == 0
                 and padding_mask.shape[1] // self.config.tensor_model_parallel_size
