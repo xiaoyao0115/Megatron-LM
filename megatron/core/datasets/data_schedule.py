@@ -808,14 +808,12 @@ def get_batch_on_this_rank_for_sequence_packing(
         else None
     )
 
-    # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
-    # loss paths (e.g. CSA indexer KL) can identify padding rows.
-    # cu_seqlens_q/kv_padded hold the padded boundaries consumed by attention
-    # kernels and THD partitioning.
+    # Baseline workaround: expose padded boundaries through both fields so the
+    # legacy pad_between_seqs=False path treats physical gaps as regular tokens.
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
