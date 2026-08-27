@@ -53,6 +53,12 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def is_p2p_cp_comm_type(cp_comm_type) -> bool:
+    """Return whether every configured attention CP transport uses the P2P path."""
+    cp_comm_types = cp_comm_type if isinstance(cp_comm_type, (list, tuple)) else (cp_comm_type,)
+    return all(comm_type in (None, "p2p") for comm_type in cp_comm_types)
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -3795,6 +3801,49 @@ class TransformerConfig(ModelParallelConfig):
                 "supported together with a sequence_packing_scheduler. Either enable a "
                 "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
+
+        if self.dynamic_context_parallel and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl != "transformer_engine":
+                raise ValueError("Dynamic CP supports only layer-wise TE CUDA graphs.")
+            if not self.cuda_graph_dynamic_microbatches:
+                raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
+            if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:
+                raise ValueError("Dynamic CP graphs do not support delayed wgrad or EP overlap.")
+            captures_attention = (
+                not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules
+            )
+            if captures_attention and not is_p2p_cp_comm_type(self.cp_comm_type):
+                raise ValueError(
+                    "Dynamic CP CUDA graph attention currently supports cp_comm_type='p2p' "
+                    "only; subgroup a2a/all-gather collectives cannot share the parent graph "
+                    "communicator."
+                )
+            if (
+                captures_attention
+                and (
+                    (
+                        self.fp8 is not None
+                        and (
+                            self.fp8_dot_product_attention
+                            or self.fp8_multi_head_attention
+                            or self.fp8_recipe == Fp8Recipe.custom
+                        )
+                    )
+                    or (
+                        self.fp4 is not None
+                        and (
+                            self.fp8_dot_product_attention
+                            or self.fp4_recipe == Fp4Recipe.custom
+                        )
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Dynamic CP CUDA graph attention does not support FP8 DPA/MHA or custom "
+                    "FP8/FP4 recipes: TE's P2P context-parallel backward can use a "
+                    "logical-subgroup all-to-all that cannot use the shared parent graph "
+                    "communicator."
+                )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

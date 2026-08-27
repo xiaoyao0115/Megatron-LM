@@ -1,12 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -29,6 +31,65 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.internal
+def test_dynamic_cp_graph_aux_loss_uses_parent_group_during_eager_warmup():
+    """Eager graph warmup must not initialize a logical-CP communicator."""
+    router = TopKRouter.__new__(TopKRouter)
+    logical_cp_group = object()
+    parent_dp_cp_group = object()
+    object.__setattr__(
+        router,
+        "config",
+        SimpleNamespace(
+            dynamic_context_parallel=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_dynamic_microbatches=True,
+            cuda_graph_modules=[CudaGraphModule.moe_router],
+            _cuda_graph_parent_router_reduction=True,
+        ),
+    )
+    object.__setattr__(router, "tp_group", object())
+    object.__setattr__(router, "tp_cp_group", object())
+    object.__setattr__(router, "tp_dp_cp_group", object())
+    object.__setattr__(router, "dp_cp_group", parent_dp_cp_group)
+
+    groups = router._get_aux_loss_groups(
+        SimpleNamespace(local_cp_size=2, cp_group=logical_cp_group)
+    )
+
+    assert groups.loss_reduce_groups[0] is logical_cp_group
+    assert groups.dynamic_cp_parent_group is parent_dp_cp_group
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("graph_module", [CudaGraphModule.attn, CudaGraphModule.moe_router])
+def test_dynamic_cp_eager_router_does_not_use_graph_parent_group(graph_module):
+    """Graph configuration alone must leave an eager router communicator unchanged."""
+    router = TopKRouter.__new__(TopKRouter)
+    logical_cp_group = object()
+    parent_dp_cp_group = object()
+    object.__setattr__(
+        router,
+        "config",
+        SimpleNamespace(
+            dynamic_context_parallel=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_dynamic_microbatches=True,
+            cuda_graph_modules=[graph_module],
+        ),
+    )
+    object.__setattr__(router, "tp_group", object())
+    object.__setattr__(router, "tp_cp_group", object())
+    object.__setattr__(router, "tp_dp_cp_group", object())
+    object.__setattr__(router, "dp_cp_group", parent_dp_cp_group)
+
+    groups = router._get_aux_loss_groups(
+        SimpleNamespace(local_cp_size=2, cp_group=logical_cp_group)
+    )
+
+    assert groups.dynamic_cp_parent_group is None
 
 
 class TestTop2Router:
