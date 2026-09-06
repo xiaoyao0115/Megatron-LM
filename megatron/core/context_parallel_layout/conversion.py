@@ -11,12 +11,14 @@ import torch
 
 from megatron.core.context_parallel_layout.routes import (
     build_thd_cp_partition_route,
+    build_thd_cp_partition_split_matrix,
     get_thd_cp_partition_route,
 )
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
 from megatron.core.context_parallel_layout.utils import (
     get_packed_seq_params_cp_partition_cu_seqlens,
 )
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import nvtx_range
 
@@ -323,6 +325,83 @@ def _scatter_thd_cp_route_recv_buffer(
     return out
 
 
+def _logical_ring_all_to_all_impl(
+    input_: torch.Tensor,
+    group: LogicalCPGroup,
+    split_matrix: Tuple[Tuple[int, ...], ...],
+    *,
+    channel: int,
+) -> torch.Tensor:
+    """Route one all-to-all permutation over the logical bounded-peer ring."""
+    from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
+
+    transport = get_native_cp_transport(group)
+    if transport is None:
+        raise RuntimeError("Logical CP layout conversion has no native parent transport")
+
+    cp_size = group.size()
+    cp_rank = group.rank()
+    if len(split_matrix) != cp_size or any(len(row) != cp_size for row in split_matrix):
+        raise ValueError("Logical CP split matrix shape must match the group size")
+    row_totals = tuple(sum(row) for row in split_matrix)
+    if len(set(row_totals)) != 1 or row_totals[cp_rank] != input_.size(0):
+        raise ValueError(
+            "Bounded-ring layout conversion requires equal rank-local row counts, "
+            f"got row_totals={row_totals}, local_rows={input_.size(0)}."
+        )
+
+    output_split_sizes = tuple(split_matrix[source][cp_rank] for source in range(cp_size))
+    output = input_.new_empty((sum(output_split_sizes), *input_.shape[1:]))
+    scratch = torch.empty_like(input_)
+    output_offsets = [0]
+    for size in output_split_sizes:
+        output_offsets.append(output_offsets[-1] + size)
+
+    ranks = tuple(group.ranks)
+    current = input_
+    for step in range(cp_size):
+        source_rank = (cp_rank - step) % cp_size
+        source_row = split_matrix[source_rank]
+        chunk_size = source_row[cp_rank]
+        if chunk_size:
+            input_offset = sum(source_row[:cp_rank])
+            output[output_offsets[source_rank] : output_offsets[source_rank + 1]].copy_(
+                current[input_offset : input_offset + chunk_size]
+            )
+        if step + 1 < cp_size:
+            current = transport.exchange(
+                current,
+                ranks[(cp_rank + 1) % cp_size],
+                ranks[(cp_rank - 1) % cp_size],
+                channel=channel,
+                out=scratch,
+            )
+    return output
+
+
+class _LogicalRingAllToAll(torch.autograd.Function):
+    """Autograd wrapper for bounded-ring THD layout redistribution."""
+
+    @staticmethod
+    def forward(ctx, input_, group, split_matrix):
+        """Redistribute the forward tensor over the logical CP ring."""
+        ctx.group = group
+        ctx.split_matrix = split_matrix
+        return _logical_ring_all_to_all_impl(input_, group, split_matrix, channel=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Apply the transposed redistribution to the output gradient."""
+        transpose = tuple(
+            tuple(row[column] for row in ctx.split_matrix)
+            for column in range(len(ctx.split_matrix))
+        )
+        grad_input = _logical_ring_all_to_all_impl(
+            grad_output.contiguous(), ctx.group, transpose, channel=1
+        )
+        return grad_input, None, None
+
+
 def _redistribute_thd_layout(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup],
@@ -394,12 +473,30 @@ def _redistribute_thd_layout(
                 send_buf = send_buf.contiguous()
 
         with nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
-            recv_buf = all_to_all(
-                group=cp_group,
-                input_=send_buf,
-                output_split_sizes_=output_split_sizes,
-                input_split_sizes=input_split_sizes,
-            )
+            if isinstance(cp_group, LogicalCPGroup):
+                split_matrix = build_thd_cp_partition_split_matrix(
+                    cu_seqlens, cp_size, source_partition_mode, target_partition_mode
+                )
+                expected_input_splits = split_matrix[cp_rank]
+                expected_output_splits = tuple(
+                    split_matrix[source][cp_rank] for source in range(cp_size)
+                )
+                if tuple(input_split_sizes) != expected_input_splits:
+                    raise ValueError(
+                        "Logical CP route input splits do not match the full split matrix"
+                    )
+                if tuple(output_split_sizes) != expected_output_splits:
+                    raise ValueError(
+                        "Logical CP route output splits do not match the full split matrix"
+                    )
+                recv_buf = _LogicalRingAllToAll.apply(send_buf, cp_group, split_matrix)
+            else:
+                recv_buf = all_to_all(
+                    group=cp_group,
+                    input_=send_buf,
+                    output_split_sizes_=output_split_sizes,
+                    input_split_sizes=input_split_sizes,
+                )
 
         with nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
             out_shape = (local_target_length,) + tuple(x.shape[1:])

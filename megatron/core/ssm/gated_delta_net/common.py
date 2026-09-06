@@ -7,11 +7,13 @@
 
 from dataclasses import dataclass
 from functools import lru_cache
+from inspect import signature
 from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
 
+from megatron.core.extensions.native_cp_transport import initialize_native_cp_transport_for_config
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -175,6 +177,7 @@ class _GDNBase(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for a GDN-family layer"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
+        self._dynamic_cp_parent_group = getattr(pg_collection, "dp_cp", None)
         # Static/max CP size from model construction. Runtime dynamic CP paths must resolve
         # the effective group from packed_seq_params instead of using this value.
         self.cp_size = self.pg_collection.cp.size()
@@ -195,6 +198,28 @@ class _GDNBase(MegatronModule):
         self.v_dim = self.value_head_dim * self.num_value_heads
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
+
+        if self.config.use_native_cp_transport:
+            if self._dynamic_cp_parent_group is None:
+                raise RuntimeError("Native CP transport requires pg_collection.dp_cp.")
+            if self.config.linear_cp_mode != "chunkwise":
+                raise ValueError(
+                    "Arbitrary-size native CP for GDN-family layers requires "
+                    "linear_cp_mode='chunkwise'."
+                )
+            if self.config.cp_partition_mode != "contiguous":
+                raise ValueError(
+                    "Arbitrary-size native CP for GDN-family layers requires "
+                    "cp_partition_mode='contiguous'."
+                )
+            if "transport" not in signature(build_cp_context).parameters:
+                raise RuntimeError(
+                    "The installed flash-linear-attention does not support logical CP "
+                    "transport. Install an FLA build with build_cp_context(..., transport=...)."
+                )
+            initialize_native_cp_transport_for_config(
+                self._dynamic_cp_parent_group, self.config, self.tp_size, include_gdn_state=True
+            )
 
         # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
         if self.config.linear_cp_mode == "headwise":
@@ -322,7 +347,9 @@ class _GDNBase(MegatronModule):
         )
         # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
         # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
-        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
+        self._chunkwise_cp_context_cache: dict[
+            tuple[int, int, object], tuple[torch.Tensor, object]
+        ] = {}
 
         self.reset_parameters()
 

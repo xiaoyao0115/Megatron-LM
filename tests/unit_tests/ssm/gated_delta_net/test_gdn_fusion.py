@@ -59,6 +59,75 @@ def test_fused_pre_gdr_split_batched_recv_send_works():
         _split_batched_recv_send_works([], ["recv"])
 
 
+class _LogicalCPGroup:
+    ranks = (0, 1, 3, 4, 2)
+
+    def __init__(self, cp_rank):
+        self.cp_rank = cp_rank
+
+    def size(self):
+        return len(self.ranks)
+
+    def rank(self):
+        return self.cp_rank
+
+
+class _FakeCPTransport:
+    def __init__(self):
+        self.calls = []
+
+    def exchange(self, tensor, send_global_rank, recv_global_rank, channel=0, out=None):
+        self.calls.append((send_global_rank, recv_global_rank, channel))
+        result = torch.full_like(tensor, recv_global_rank)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+
+@pytest.mark.parametrize("cp_rank", range(5))
+def test_fused_pre_gdr_logical_forward_boundary_exchange(cp_rank):
+    from megatron.core.fusions.fused_pre_gated_delta_rule import _start_left_boundary_exchange
+
+    group = _LogicalCPGroup(cp_rank)
+    transport = _FakeCPTransport()
+    qkvzba = torch.zeros(8, 1, 6)
+
+    boundary, recv_works, send_works, _ = _start_left_boundary_exchange(
+        qkvzba, conv_dim=4, boundary=2, cp_group=group, cp_transport=transport
+    )
+
+    assert transport.calls == [(group.ranks[(cp_rank + 1) % 5], group.ranks[(cp_rank - 1) % 5], 0)]
+    assert recv_works == ()
+    assert send_works == ()
+    if cp_rank == 0:
+        assert boundary is None
+    else:
+        torch.testing.assert_close(boundary, torch.full_like(boundary, group.ranks[cp_rank - 1]))
+
+
+@pytest.mark.parametrize("cp_rank", range(5))
+def test_fused_pre_gdr_logical_backward_boundary_exchange(cp_rank):
+    from megatron.core.fusions.fused_pre_gated_delta_rule import _start_boundary_grad_exchange
+
+    group = _LogicalCPGroup(cp_rank)
+    transport = _FakeCPTransport()
+    qkvzba = torch.zeros(8, 1, 6)
+    left_gradient = None if cp_rank == 0 else torch.ones(2, 1, 4)
+
+    boundary, recv_works, send_works, _ = _start_boundary_grad_exchange(
+        qkvzba, left_gradient, conv_dim=4, boundary=2, cp_group=group, cp_transport=transport
+    )
+
+    assert transport.calls == [(group.ranks[(cp_rank - 1) % 5], group.ranks[(cp_rank + 1) % 5], 1)]
+    assert recv_works == ()
+    assert send_works == ()
+    if cp_rank == 4:
+        assert boundary is None
+    else:
+        torch.testing.assert_close(boundary, torch.full_like(boundary, group.ranks[cp_rank + 1]))
+
+
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.skipif(not HAVE_FUSED_PRE_GDR, reason="causal-conv1d fused backward is not installed.")
 @pytest.mark.internal

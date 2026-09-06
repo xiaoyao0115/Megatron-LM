@@ -1838,6 +1838,17 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
                     f"got {self.linear_cp_mode!r}."
                 )
+            if self.use_native_cp_transport:
+                if self.linear_cp_mode != "chunkwise":
+                    raise ValueError(
+                        "Arbitrary-size native CP for GDN-family layers requires "
+                        "linear_cp_mode='chunkwise'."
+                    )
+                if self.cp_partition_mode != "contiguous":
+                    raise ValueError(
+                        "Arbitrary-size native CP for GDN-family layers requires "
+                        "cp_partition_mode='contiguous'."
+                    )
             if self.gdn_conv_pad_alignment is not None:
                 assert self.gdn_conv_pad_alignment > 0, (
                     f"gdn_conv_pad_alignment must be positive when set, "

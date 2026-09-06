@@ -1376,6 +1376,15 @@ class Attention(MegatronModule, ABC):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+            if self.config.use_native_cp_transport:
+                dynamic_cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+                if dynamic_cp_parent_group is None:
+                    raise RuntimeError("Native CP transport requires pg_collection.dp_cp.")
+                from transformer_engine.pytorch.attention.native_cp_transport import (
+                    set_native_cp_parent_group,
+                )
+
+                set_native_cp_parent_group(self.pg_collection.cp, dynamic_cp_parent_group)
         hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
             hidden_states=hidden_states,
             key_value_states=key_value_states,

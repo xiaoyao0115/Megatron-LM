@@ -24,6 +24,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.dynamic_cp_group import get_process_group_ranks
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.native_cp_transport import initialize_native_cp_transport_for_config
 from megatron.core.extensions.transformer_engine_int4_fake_qat import (
     maybe_fake_quantize_int4_weight_tensors,
 )
@@ -1885,28 +1886,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 raise RuntimeError("Native CP transport requires max_seqlen_per_dp_cp_rank.")
             if cp_comm_type not in (None, "p2p"):
                 raise RuntimeError("Native CP transport only supports cp_comm_type='p2p'.")
-            from transformer_engine.pytorch.attention.native_cp_transport import (
-                initialize_native_cp_transport,
-            )
-
             tp_size = self._tp_group.size() if self._tp_group is not None else 1
-            local_groups = max(1, self.config.num_query_groups // tp_size)
-            kv_width = (
-                sum(kv_channels) if isinstance(kv_channels, (tuple, list)) else 2 * kv_channels
+            initialize_native_cp_transport_for_config(
+                self._dynamic_cp_parent_group, self.config, tp_size, kv_channels
             )
-            kv_bytes = (
-                self.config.max_seqlen_per_dp_cp_rank
-                * local_groups
-                * kv_width
-                * torch.empty((), dtype=self.config.params_dtype).element_size()
-            )
-            pair_bytes = 2 * kv_bytes
-            payload_bytes = ((pair_bytes + 255) // 256) * 256 + pair_bytes
-            if self.config.num_moe_experts:
-                max_packed_sequences = max(1, self.config.thd_max_packed_sequences or 1)
-                aux_bytes = self.config.num_moe_experts * max_packed_sequences * 8
-                payload_bytes = max(payload_bytes, ((aux_bytes + 255) // 256) * 256 + aux_bytes)
-            initialize_native_cp_transport(self._dynamic_cp_parent_group, payload_bytes)
 
         if self.config.softmax_type != "vanilla":
             assert is_te_min_version("2.8.0"), (

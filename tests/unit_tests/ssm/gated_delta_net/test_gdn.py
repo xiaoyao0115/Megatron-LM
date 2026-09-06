@@ -151,6 +151,39 @@ def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
     assert config.linear_cp_mode == "chunkwise"
 
 
+def test_gdn_native_cp_requires_chunkwise_mode():
+    with pytest.raises(ValueError, match="requires linear_cp_mode='chunkwise'"):
+        _make_gdn_config(
+            dynamic_context_parallel=True,
+            use_native_cp_transport=True,
+            max_seqlen_per_dp_cp_rank=128,
+            linear_cp_mode="headwise",
+        )
+
+
+def test_gdn_native_cp_requires_contiguous_partition():
+    with pytest.raises(ValueError, match="requires cp_partition_mode='contiguous'"):
+        _make_gdn_config(
+            dynamic_context_parallel=True,
+            use_native_cp_transport=True,
+            max_seqlen_per_dp_cp_rank=128,
+            linear_cp_mode="chunkwise",
+            cp_partition_mode="zigzag",
+        )
+
+
+def test_gdn_native_cp_accepts_chunkwise_contiguous_partition():
+    config = _make_gdn_config(
+        dynamic_context_parallel=True,
+        use_native_cp_transport=True,
+        max_seqlen_per_dp_cp_rank=128,
+        linear_cp_mode="chunkwise",
+        cp_partition_mode="contiguous",
+    )
+
+    assert config.use_native_cp_transport
+
+
 def test_torch_chunk_gated_delta_rule_preserves_public_signature():
     signature = inspect.signature(torch_chunk_gated_delta_rule)
     assert tuple(signature.parameters) == (

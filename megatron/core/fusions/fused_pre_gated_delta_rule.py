@@ -1677,10 +1677,13 @@ def _cp_neighbor_global_ranks(cp_group) -> Tuple[int, int, Optional[int], Option
 
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    prev_rank = torch.distributed.get_global_rank(cp_group, cp_rank - 1) if cp_rank > 0 else None
-    next_rank = (
-        torch.distributed.get_global_rank(cp_group, cp_rank + 1) if cp_rank < cp_size - 1 else None
+    ranks = (
+        tuple(cp_group.ranks)
+        if hasattr(cp_group, "ranks")
+        else tuple(torch.distributed.get_process_group_ranks(cp_group))
     )
+    prev_rank = ranks[cp_rank - 1] if cp_rank > 0 else None
+    next_rank = ranks[cp_rank + 1] if cp_rank < cp_size - 1 else None
     return cp_size, cp_rank, prev_rank, next_rank
 
 
@@ -1720,11 +1723,19 @@ def _split_batched_recv_send_works(works, op_roles) -> Tuple[Tuple, Tuple]:
 
 
 def _start_left_boundary_exchange(
-    qkvzba: Tensor, *, conv_dim: int, boundary: int, cp_group
+    qkvzba: Tensor, *, conv_dim: int, boundary: int, cp_group, cp_transport=None
 ) -> Tuple[Optional[Tensor], Tuple, Tuple, Optional[Tensor]]:
     """Start chunkwise-CP left-boundary exchange without waiting for completion."""
 
-    _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    cp_size, cp_rank, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    if cp_transport is not None:
+        ranks = tuple(cp_group.ranks)
+        send_buf = qkvzba[-boundary:, :, :conv_dim].contiguous()
+        received = cp_transport.exchange(
+            send_buf, ranks[(cp_rank + 1) % cp_size], ranks[(cp_rank - 1) % cp_size], channel=0
+        )
+        return (None if cp_rank == 0 else received), (), (), send_buf
+
     left_boundary = None
     send_buf = None
     recv_ops = []
@@ -1752,11 +1763,29 @@ def _start_left_boundary_exchange(
 
 
 def _start_boundary_grad_exchange(
-    qkvzba: Tensor, d_left_boundary: Optional[Tensor], *, conv_dim: int, boundary: int, cp_group
+    qkvzba: Tensor,
+    d_left_boundary: Optional[Tensor],
+    *,
+    conv_dim: int,
+    boundary: int,
+    cp_group,
+    cp_transport=None,
 ) -> Tuple[Optional[Tensor], Tuple, Tuple, Optional[Tensor]]:
     """Start chunkwise-CP boundary-gradient exchange without waiting for completion."""
 
-    _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    cp_size, cp_rank, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    if cp_transport is not None:
+        ranks = tuple(cp_group.ranks)
+        send_buf = (
+            d_left_boundary.contiguous()
+            if d_left_boundary is not None
+            else qkvzba.new_zeros((boundary, qkvzba.shape[1], conv_dim))
+        )
+        received = cp_transport.exchange(
+            send_buf, ranks[(cp_rank - 1) % cp_size], ranks[(cp_rank + 1) % cp_size], channel=1
+        )
+        return (None if cp_rank == cp_size - 1 else received), (), (), send_buf
+
     d_right_boundary = None
     send_buf = None
     recv_ops = []
@@ -1797,6 +1826,7 @@ def _triton_pre_gated_delta_rule_forward(
     value_head_dim: int,
     cu_seqlens: Optional[Tensor] = None,
     cp_group=None,
+    cp_transport=None,
     cp_size: int = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor], int, int]:
     """Triton-backed forward for the pre-gated-delta-rule front-end.
@@ -1835,7 +1865,11 @@ def _triton_pre_gated_delta_rule_forward(
     if cp_active:
         left_boundary, left_boundary_recv_ops, left_boundary_send_ops, _left_boundary_send_buf = (
             _start_left_boundary_exchange(
-                qkvzba, conv_dim=conv_dim, boundary=boundary, cp_group=cp_group
+                qkvzba,
+                conv_dim=conv_dim,
+                boundary=boundary,
+                cp_group=cp_group,
+                cp_transport=cp_transport,
             )
         )
         if is_packed_thd:
@@ -2189,6 +2223,7 @@ def _triton_pre_gated_delta_rule_backward(
     global_token_offset: int = 0,
     global_seq_len: Optional[int] = None,
     cp_group=None,
+    cp_transport=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     """Triton-backed backward for the pre-gated-delta-rule front-end.
 
@@ -2372,7 +2407,12 @@ def _triton_pre_gated_delta_rule_backward(
             left_boundary_send_ops,
             _left_boundary_send_buf,
         ) = _start_boundary_grad_exchange(
-            qkvzba, d_left_boundary, conv_dim=conv_dim, boundary=k_w - 1, cp_group=cp_group
+            qkvzba,
+            d_left_boundary,
+            conv_dim=conv_dim,
+            boundary=k_w - 1,
+            cp_group=cp_group,
+            cp_transport=cp_transport,
         )
         d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
         _wait_distributed_ops(right_boundary_recv_ops)
@@ -2418,6 +2458,7 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens,
         seq_idx,
         cp_group,
+        cp_transport,
         cp_size,
         num_key_heads,
         num_value_heads,
@@ -2434,6 +2475,7 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         cp_active = cp_group is not None and cp_size > 1 and boundary > 0
         ctx.cp_active = cp_active
         ctx.cp_group = cp_group
+        ctx.cp_transport = cp_transport
         ctx.has_cu_seqlens = False
         ctx.has_left_boundary = False
         ctx.global_token_offset = 0
@@ -2473,6 +2515,7 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             value_head_dim=value_head_dim,
             cu_seqlens=cu_seqlens,
             cp_group=cp_group,
+            cp_transport=cp_transport,
             cp_size=cp_size,
         )
         ctx.has_left_boundary = left_boundary is not None
@@ -2546,10 +2589,11 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
                 global_token_offset=ctx.global_token_offset,
                 global_seq_len=ctx.global_seq_len,
                 cp_group=ctx.cp_group if ctx.cp_active else None,
+                cp_transport=ctx.cp_transport if ctx.cp_active else None,
             )
         )
         # Match forward inputs: (qkvzba, conv1d_weight, A_log, dt_bias,
-        # cu_seqlens, seq_idx, cp_group, cp_size, num_key_heads, num_value_heads,
+        # cu_seqlens, seq_idx, cp_group, cp_transport, cp_size, num_key_heads, num_value_heads,
         # key_head_dim, value_head_dim).
         # Non-tensor args get None.
         return (
@@ -2557,6 +2601,7 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             d_weight,
             d_A_log,
             d_dt_bias,
+            None,
             None,
             None,
             None,
@@ -2583,6 +2628,7 @@ def fused_streamed_pre_gated_delta_rule(
     cu_seqlens: Optional[Tensor] = None,
     seq_idx: Optional[Tensor] = None,
     cp_group=None,
+    cp_transport=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Streamed fused pre-gated-delta-rule entry point.
 
@@ -2606,6 +2652,7 @@ def fused_streamed_pre_gated_delta_rule(
             ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
         cp_group: Optional chunkwise-CP process group. When it has size > 1,
             the fused path prepends a previous-rank conv boundary internally.
+        cp_transport: Optional logical-group point-to-point transport.
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
@@ -2689,6 +2736,7 @@ def fused_streamed_pre_gated_delta_rule(
         cu_seqlens,
         seq_idx,
         cp_group,
+        cp_transport,
         cp_size,
         num_key_heads,
         num_value_heads,

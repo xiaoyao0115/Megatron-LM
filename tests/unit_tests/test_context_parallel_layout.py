@@ -15,8 +15,10 @@ from megatron.core.context_parallel_layout import (
 )
 from megatron.core.context_parallel_layout.routes import (
     build_thd_cp_partition_route,
+    build_thd_cp_partition_split_matrix,
     get_thd_cp_partition_route,
 )
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -218,6 +220,74 @@ def test_thd_cp_partition_route_reassembles_target_layout(
             out = torch.empty(local_target_length, dtype=recv_buf.dtype)
             out.index_copy_(0, recv_index, recv_buf)
         assert torch.equal(out, target_indices[dst_rank])
+
+
+def test_logical_cp_thd_layout_ring_matches_all_to_all(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    cp_size = 5
+    ranks = (0, 1, 3, 4, 2)
+    cu_seqlens = torch.tensor([0, 40, 80], dtype=torch.int32)
+    split_matrix = build_thd_cp_partition_split_matrix(cu_seqlens, cp_size, "contiguous", "zigzag")
+    routes = [
+        build_thd_cp_partition_route(cu_seqlens, cp_size, cp_rank) for cp_rank in range(cp_size)
+    ]
+    source_indices = [
+        _get_test_thd_token_indices(cu_seqlens, cp_size, cp_rank, "contiguous")
+        for cp_rank in range(cp_size)
+    ]
+    send_buffers = [
+        source if route.contiguous_index is None else source.index_select(0, route.contiguous_index)
+        for source, route in zip(source_indices, routes)
+    ]
+
+    class _FakeRingTransport:
+
+        def __init__(self, cp_rank):
+            self.cp_rank = cp_rank
+            self.step = 0
+            self.calls = []
+
+        def exchange(self, tensor, send_global_rank, recv_global_rank, channel=0, out=None):
+            self.step += 1
+            self.calls.append((send_global_rank, recv_global_rank, channel))
+            source_rank = (self.cp_rank - self.step) % cp_size
+            result = send_buffers[source_rank]
+            if out is None:
+                return result.clone()
+            out.copy_(result)
+            return out
+
+    transport_module = ModuleType("transformer_engine.pytorch.attention.native_cp_transport")
+    monkeypatch.setitem(sys.modules, transport_module.__name__, transport_module)
+
+    for cp_rank in range(cp_size):
+        group = LogicalCPGroup(ranks=ranks, cp_size=cp_size, cp_rank=cp_rank)
+        transport = _FakeRingTransport(cp_rank)
+        monkeypatch.setattr(
+            transport_module,
+            "get_native_cp_transport",
+            lambda candidate_group, expected_group=group, result=transport: (
+                result if candidate_group is expected_group else None
+            ),
+            raising=False,
+        )
+
+        received = context_parallel_layout_conversion._logical_ring_all_to_all_impl(
+            send_buffers[cp_rank], group, split_matrix, channel=0
+        )
+        expected_chunks = []
+        for source_rank in range(cp_size):
+            source_row = split_matrix[source_rank]
+            offset = sum(source_row[:cp_rank])
+            expected_chunks.append(send_buffers[source_rank][offset : offset + source_row[cp_rank]])
+        expected = torch.cat(expected_chunks)
+
+        torch.testing.assert_close(received, expected, rtol=0, atol=0)
+        assert transport.calls == [
+            (ranks[(cp_rank + 1) % cp_size], ranks[(cp_rank - 1) % cp_size], 0)
+        ] * (cp_size - 1)
 
 
 def test_thd_cp_partition_route_stores_bidirectional_layout_views():

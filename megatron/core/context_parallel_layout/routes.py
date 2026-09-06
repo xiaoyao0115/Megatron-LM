@@ -3,6 +3,7 @@
 """THD context-parallel route helpers."""
 
 import warnings
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -143,6 +144,64 @@ def _build_thd_layout_side_route(
     if all(row == index for index, row in enumerate(row_order)):
         return None, split_sizes
     return torch.tensor(row_order, device=device, dtype=torch.long), split_sizes
+
+
+@lru_cache(maxsize=128)
+def _build_thd_cp_partition_split_matrix_cached(
+    cu: Tuple[int, ...],
+    cp_size: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Build source-by-destination row counts for a THD layout permutation."""
+    source_segments_by_rank = [
+        _build_thd_layout_segments(list(cu), cp_size, rank, source_partition_mode)[0]
+        for rank in range(cp_size)
+    ]
+    target_segments_by_rank = [
+        _build_thd_layout_segments(list(cu), cp_size, rank, target_partition_mode)[0]
+        for rank in range(cp_size)
+    ]
+    return tuple(
+        tuple(
+            sum(
+                length
+                for _, _, length in _intersect_thd_layout_segments(
+                    source_segments_by_rank[source_rank], target_segments_by_rank[target_rank]
+                )
+            )
+            for target_rank in range(cp_size)
+        )
+        for source_rank in range(cp_size)
+    )
+
+
+def build_thd_cp_partition_split_matrix(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Return all rank-to-rank row counts for a THD layout permutation.
+
+    Logical CP groups use this metadata to route the permutation over their
+    bounded-neighbor ring without constructing an all-to-all communicator.
+    """
+    if source_partition_mode == target_partition_mode:
+        raise ValueError("A THD partition split matrix requires different source and target modes")
+    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
+        "zigzag",
+        "contiguous",
+    ):
+        raise ValueError(
+            f"Unsupported THD partition conversion {source_partition_mode!r} -> "
+            f"{target_partition_mode!r}."
+        )
+    cu = tuple(_compact_thd_cu_seqlens_to_list(cu_seqlens))
+    _validate_thd_route_partitioning(list(cu), cp_size)
+    return _build_thd_cp_partition_split_matrix_cached(
+        cu, cp_size, source_partition_mode, target_partition_mode
+    )
 
 
 def build_thd_cp_partition_route(

@@ -145,6 +145,20 @@ class GatedDeltaNet(_GDNBase):
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
         cp_size_runtime = cp_group.size()
+        chunkwise_cp_transport = None
+        if self.config.use_native_cp_transport and cp_size_chunkwise > 1:
+            dynamic_cp_parent_group = getattr(active_pg_collection, "dp_cp", None)
+            if dynamic_cp_parent_group is None:
+                raise RuntimeError("Native CP transport requires pg_collection.dp_cp.")
+            from transformer_engine.pytorch.attention.native_cp_transport import (
+                get_native_cp_transport,
+                set_native_cp_parent_group,
+            )
+
+            set_native_cp_parent_group(cp_group_chunkwise, dynamic_cp_parent_group)
+            chunkwise_cp_transport = get_native_cp_transport(cp_group_chunkwise)
+            if chunkwise_cp_transport is None:
+                raise RuntimeError("Native CP transport is not initialized for the runtime group.")
         back_to_input_converter = None
         if self.config.linear_cp_mode == "chunkwise":
             hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
@@ -222,7 +236,7 @@ class GatedDeltaNet(_GDNBase):
 
         if cp_size_chunkwise > 1:
             if cu_seqlens_q is None:
-                cache_key = (seq_len_global, batch)
+                cache_key = (seq_len_global, batch, cp_group_chunkwise)
                 cached = self._chunkwise_cp_context_cache.get(cache_key)
                 if cached is None:
                     cached_cu_seqlens = (
@@ -231,20 +245,26 @@ class GatedDeltaNet(_GDNBase):
                         )
                         * seq_len_global
                     )
-                    cached_ctx = build_cp_context(
+                    context_kwargs = dict(
                         cu_seqlens=cached_cu_seqlens,
                         group=cp_group_chunkwise,
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
+                    if chunkwise_cp_transport is not None:
+                        context_kwargs["transport"] = chunkwise_cp_transport
+                    cached_ctx = build_cp_context(**context_kwargs)
                     cached = (cached_cu_seqlens, cached_ctx)
                     self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
-                chunkwise_cp_context = build_cp_context(
+                context_kwargs = dict(
                     cu_seqlens=cu_seqlens_q,
                     group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
                 )
+                if chunkwise_cp_transport is not None:
+                    context_kwargs["transport"] = chunkwise_cp_transport
+                chunkwise_cp_context = build_cp_context(**context_kwargs)
         else:
             chunkwise_cp_context = None
 
@@ -345,6 +365,7 @@ class GatedDeltaNet(_GDNBase):
                 seq_idx=seq_idx,
                 cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
                 cp_group_headwise=cp_group_headwise,
+                cp_transport=getattr(chunkwise_cp_context, "transport", None),
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
@@ -573,7 +594,13 @@ class GatedDeltaNet(_GDNBase):
         )
 
     def _fused_streamed_pre_gated_delta_rule(
-        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None, cp_group_headwise=None
+        self,
+        qkvzba,
+        cu_seqlens_q=None,
+        seq_idx=None,
+        cp_group=None,
+        cp_group_headwise=None,
+        cp_transport=None,
     ):
         """Call the streamed fused pre-GDR wrapper."""
 
@@ -629,6 +656,7 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens=cu_seqlens_q,
             seq_idx=seq_idx,
             cp_group=cp_group,
+            cp_transport=cp_transport,
         )
 
 
