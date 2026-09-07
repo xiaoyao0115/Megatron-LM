@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -1467,6 +1468,145 @@ class TestMultiTokenPrediction:
             assert torch.equal(rolled, expected)
 
         Utils.destroy_model_parallel()
+
+    def test_contiguous_packed_cp_roll_plan_accepts_logical_group(self, monkeypatch):
+        """Logical CP neighbor metadata must not call ProcessGroup-only APIs."""
+        logical_group = LogicalCPGroup(ranks=(10, 11, 13, 14, 12), cp_size=5, cp_rank=3)
+        tensor = torch.tensor([[13, 14, 15, 16]], dtype=torch.long)
+        cu_seqlens = torch.tensor([0, 20], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=20,
+            max_seqlen_kv=20,
+            qkv_format="thd",
+            cp_partition_mode="contiguous",
+        )
+
+        def process_group_only_api(*args, **kwargs):
+            raise AssertionError("LogicalCPGroup must not enter a ProcessGroup-only API")
+
+        monkeypatch.setattr(torch.distributed, "get_rank", process_group_only_api)
+        monkeypatch.setattr(torch.distributed, "get_process_group_ranks", process_group_only_api)
+        context = prepare_mtp_sequence_roll_context(
+            tensor=tensor, cp_group=logical_group, packed_seq_params=packed_seq_params
+        )
+
+        assert isinstance(context, ContiguousPackedCPRollContext)
+        assert context.plan.cp_group is logical_group
+        assert context.plan.send_rank == 13
+        assert context.plan.recv_rank == 12
+        assert context.plan.right_halo_valid_count.item() == 4
+
+    def test_contiguous_packed_cp_logical_group_uses_native_transport(self, monkeypatch):
+        """Logical CP MTP halos and fallback rolls stay off NCCL subgroup P2P."""
+        logical_group = LogicalCPGroup(ranks=(4, 5, 7, 8, 6), cp_size=5, cp_rank=3)
+        tensor = torch.tensor([[13, 14, 15, 16]], dtype=torch.long)
+        cu_seqlens = torch.tensor([0, 20], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=20,
+            max_seqlen_kv=20,
+            qkv_format="thd",
+            cp_partition_mode="contiguous",
+        )
+        context = prepare_mtp_sequence_roll_context(
+            tensor=tensor, cp_group=logical_group, packed_seq_params=packed_seq_params
+        )
+        assert isinstance(context, ContiguousPackedCPRollContext)
+
+        class FakeNativeTransport:
+            def __init__(self):
+                self.calls = []
+
+            def exchange(self, send, send_rank, recv_rank, channel, out):
+                self.calls.append((send.clone(), send_rank, recv_rank, channel))
+                received = torch.tensor([17, 18], dtype=send.dtype)[: send.numel()].view_as(out)
+                out.copy_(received)
+                return out
+
+        transport = FakeNativeTransport()
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction." "_get_mtp_native_cp_transport",
+            lambda group: transport,
+        )
+
+        def unexpected_subgroup_p2p(*args, **kwargs):
+            raise AssertionError("Logical CP MTP must not use NCCL subgroup P2P")
+
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", unexpected_subgroup_p2p)
+
+        fallback_rolled = roll_tensor(
+            [tensor],
+            cp_group=logical_group,
+            packed_seq_params=packed_seq_params,
+            roll_context=context,
+        )[0]
+        assert torch.equal(fallback_rolled, torch.tensor([[14, 15, 16, 17]]))
+
+        context = context.prefetch_halos(width=2, input_ids=tensor)
+        assert isinstance(context, ContiguousPackedCPRollContext)
+        assert isinstance(context.halos, ContiguousPackedCPRollHalos)
+        assert torch.equal(context.halos.input_ids, torch.tensor([[17, 18]]))
+        assert len(transport.calls) == 2
+        for _, send_rank, recv_rank, channel in transport.calls:
+            assert send_rank == 7
+            assert recv_rank == 6
+            assert channel == 0
+
+        rolled = tensor
+        expected_by_depth = (torch.tensor([[14, 15, 16, 17]]), torch.tensor([[15, 16, 17, 18]]))
+        for depth, expected in enumerate(expected_by_depth):
+            rolled = roll_tensor(
+                [rolled],
+                cp_group=logical_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=context,
+                sequence_fields=["input_ids"],
+                roll_depth=depth,
+            )[0]
+            assert torch.equal(rolled, expected)
+
+    def test_contiguous_packed_cp_logical_endpoint_discards_cyclic_receive(self, monkeypatch):
+        """The last logical rank masks the extra receive that closes the native ring."""
+        logical_group = LogicalCPGroup(ranks=(4, 5, 7, 8, 6), cp_size=5, cp_rank=4)
+        tensor = torch.tensor([[17, 18, 19, 20]], dtype=torch.long)
+        cu_seqlens = torch.tensor([0, 20], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=20,
+            max_seqlen_kv=20,
+            qkv_format="thd",
+            cp_partition_mode="contiguous",
+        )
+        context = prepare_mtp_sequence_roll_context(
+            tensor=tensor, cp_group=logical_group, packed_seq_params=packed_seq_params
+        )
+        assert isinstance(context, ContiguousPackedCPRollContext)
+
+        class FakeNativeTransport:
+            def exchange(self, send, send_rank, recv_rank, channel, out):
+                assert send_rank == 8
+                assert recv_rank == 4
+                assert channel == 0
+                out.fill_(99)
+                return out
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction." "_get_mtp_native_cp_transport",
+            lambda group: FakeNativeTransport(),
+        )
+
+        def unexpected_subgroup_p2p(*args, **kwargs):
+            raise AssertionError("Logical CP MTP must not use NCCL subgroup P2P")
+
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", unexpected_subgroup_p2p)
+
+        context = context.prefetch_halos(width=2, input_ids=tensor)
+        assert isinstance(context, ContiguousPackedCPRollContext)
+        assert torch.equal(context.halos.input_ids, torch.zeros((1, 2), dtype=torch.long))
 
     @pytest.mark.parametrize(("cp_size", "partition_mode"), [(1, "contiguous"), (2, "zigzag")])
     def test_prepare_mtp_sequence_roll_context_skips_other_layouts(self, cp_size, partition_mode):

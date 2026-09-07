@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.dynamic_cp_group import LogicalCPGroup, get_process_group_ranks
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
@@ -65,6 +66,8 @@ _MTP_SEQUENCE_FIELD_FILL_VALUES = {
     "loss_mask": 0,
     "padding_mask": True,
 }
+
+_MTP_NATIVE_TRANSPORT_CHANNEL = 0
 
 
 class MTPSequenceRollHalos:
@@ -237,7 +240,7 @@ class ContiguousPackedSeqRollPlan:
     invalid_next: Tensor
     sequence_length: int
     device: torch.device
-    cp_group: torch.distributed.ProcessGroup
+    cp_group: torch.distributed.ProcessGroup | LogicalCPGroup
     recv_rank: Optional[int]
     send_rank: Optional[int]
     has_sequences: bool
@@ -353,7 +356,10 @@ def _get_packed_seq_end_indices(
 
 
 def _build_contiguous_packed_seq_roll_plan(
-    tensor: Tensor, dims: int, cu_seqlens: Tensor, cp_group: torch.distributed.ProcessGroup
+    tensor: Tensor,
+    dims: int,
+    cu_seqlens: Tensor,
+    cp_group: torch.distributed.ProcessGroup | LogicalCPGroup,
 ) -> ContiguousPackedSeqRollPlan:
     """Build reusable boundary and neighbor metadata for a contiguous-CP shard."""
     assert (
@@ -362,8 +368,8 @@ def _build_contiguous_packed_seq_roll_plan(
 
     local_seq_len = tensor.size(dims)
     cp_size = cp_group.size()
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = cp_group.rank()
+    global_ranks = get_process_group_ranks(cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
     if cu.numel() > 1:
@@ -418,7 +424,7 @@ def _build_contiguous_packed_seq_roll_plan(
 
 def prepare_mtp_sequence_roll_context(
     tensor: Tensor | None,
-    cp_group: torch.distributed.ProcessGroup | None,
+    cp_group: torch.distributed.ProcessGroup | LogicalCPGroup | None,
     packed_seq_params: PackedSeqParams | None,
     dims: int = -1,
 ) -> MTPSequenceRollContext | None:
@@ -453,6 +459,38 @@ def prepare_mtp_sequence_roll_context(
         plan=_build_contiguous_packed_seq_roll_plan(
             tensor, dims, _get_packed_roll_cu_seqlens(packed_seq_params), cp_group
         )
+    )
+
+
+def _get_mtp_native_cp_transport(cp_group: LogicalCPGroup):
+    """Return the native parent transport backing a logical CP descriptor."""
+    from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
+
+    transport = get_native_cp_transport(cp_group)
+    if transport is None:
+        raise RuntimeError("Logical CP MTP rolling has no native parent transport")
+    return transport
+
+
+def _exchange_logical_cp_successor_rows(
+    tensor: Tensor, cp_group: LogicalCPGroup, *, out: Tensor
+) -> Tensor:
+    """Exchange successor rows over the bounded ring without a real subgroup.
+
+    Every rank sends to its logical predecessor and receives from its logical
+    successor. The two endpoints also participate in the closing ring edge so
+    every native operation remains a symmetric send/recv. The last logical rank's
+    cyclic receive is discarded by the packed-sequence boundary mask.
+    """
+    ranks = cp_group.ranks
+    cp_rank = cp_group.rank()
+    transport = _get_mtp_native_cp_transport(cp_group)
+    return transport.exchange(
+        tensor,
+        ranks[(cp_rank - 1) % cp_group.size()],
+        ranks[(cp_rank + 1) % cp_group.size()],
+        channel=_MTP_NATIVE_TRANSPORT_CHANNEL,
+        out=out,
     )
 
 
@@ -538,7 +576,7 @@ def roll_tensor(
     tensors: List[Tensor],
     shifts: int = -1,
     dims: int = -1,
-    cp_group: torch.distributed.ProcessGroup | None = None,
+    cp_group: torch.distributed.ProcessGroup | LogicalCPGroup | None = None,
     packed_seq_params: PackedSeqParams | None = None,
     fill_values: List[Union[bool, int, float]] | None = None,
     roll_context: MTPSequenceRollContext | None = None,
@@ -689,7 +727,7 @@ def _roll_tensors_packed_seq(
     shifts: int,
     dims: int,
     packed_seq_params: PackedSeqParams,
-    cp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup | LogicalCPGroup],
     fill_values: List[Union[bool, int, float]],
     roll_context: Optional[MTPSequenceRollContext],
     sequence_fields: Optional[List[str]],
@@ -914,29 +952,34 @@ def _prefetch_contiguous_packed_cp_roll_halos(
         halo_shape[-1] = width
         halos.append(tensor.new_full(halo_shape, fill_value))
 
-    # Retain contiguous send slices until every grouped work handle completes.
-    send_buffers: List[Tensor] = []
-    p2p_ops = []
-    if plan.has_sequences and plan.recv_rank is not None:
-        for halo in halos:
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, halo, plan.recv_rank, group=plan.cp_group
-                )
-            )
-    if plan.has_sequences and plan.send_rank is not None:
-        for tensor in tensors:
+    if plan.has_sequences and isinstance(plan.cp_group, LogicalCPGroup):
+        for tensor, halo in zip(tensors, halos):
             send_buffer = tensor.narrow(-1, 0, width).contiguous()
-            send_buffers.append(send_buffer)
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, send_buffer, plan.send_rank, group=plan.cp_group
+            _exchange_logical_cp_successor_rows(send_buffer, plan.cp_group, out=halo)
+    else:
+        # Retain contiguous send slices until every grouped work handle completes.
+        send_buffers: List[Tensor] = []
+        p2p_ops = []
+        if plan.has_sequences and plan.recv_rank is not None:
+            for halo in halos:
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, halo, plan.recv_rank, group=plan.cp_group
+                    )
                 )
-            )
+        if plan.has_sequences and plan.send_rank is not None:
+            for tensor in tensors:
+                send_buffer = tensor.narrow(-1, 0, width).contiguous()
+                send_buffers.append(send_buffer)
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, send_buffer, plan.send_rank, group=plan.cp_group
+                    )
+                )
 
-    works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
-    for work in works:
-        work.wait()
+        works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
+        for work in works:
+            work.wait()
 
     # Offset d is valid only when the local tail and its (d + 1)-th successor
     # belong to the same physical packed sequence. Broadcasting this small mask
@@ -1051,39 +1094,50 @@ def _roll_tensors_packed_seq_contiguous_cp(
         return rolled_tensors
 
     recv_buffers: List[Optional[Tensor]] = [None] * len(tensors)
-    # Keep contiguous send buffers alive until every grouped work handle completes.
-    send_buffers: List[Tensor] = []
-    p2p_ops = []
-
-    if contiguous_roll_plan.recv_rank is not None:
-        # After a left roll, each local tail consumes the first element from the
-        # next contiguous CP shard.
+    works = []
+    if isinstance(contiguous_roll_plan.cp_group, LogicalCPGroup):
         for index, tensor in enumerate(tensors):
-            recv_buffer = torch.empty_like(tensor.select(dims, 0))
-            recv_buffers[index] = recv_buffer
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    recv_buffer,
-                    contiguous_roll_plan.recv_rank,
-                    group=contiguous_roll_plan.cp_group,
-                )
-            )
-    if contiguous_roll_plan.send_rank is not None:
-        # This rank's first element becomes the previous shard's local tail.
-        for tensor in tensors:
             send_buffer = tensor.select(dims, 0).contiguous()
-            send_buffers.append(send_buffer)
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend,
-                    send_buffer,
-                    contiguous_roll_plan.send_rank,
-                    group=contiguous_roll_plan.cp_group,
-                )
+            recv_buffer = torch.empty_like(send_buffer)
+            _exchange_logical_cp_successor_rows(
+                send_buffer, contiguous_roll_plan.cp_group, out=recv_buffer
             )
+            if contiguous_roll_plan.recv_rank is not None:
+                recv_buffers[index] = recv_buffer
+    else:
+        # Keep contiguous send buffers alive until every grouped work handle completes.
+        send_buffers: List[Tensor] = []
+        p2p_ops = []
 
-    works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
+        if contiguous_roll_plan.recv_rank is not None:
+            # After a left roll, each local tail consumes the first element from the
+            # next contiguous CP shard.
+            for index, tensor in enumerate(tensors):
+                recv_buffer = torch.empty_like(tensor.select(dims, 0))
+                recv_buffers[index] = recv_buffer
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        recv_buffer,
+                        contiguous_roll_plan.recv_rank,
+                        group=contiguous_roll_plan.cp_group,
+                    )
+                )
+        if contiguous_roll_plan.send_rank is not None:
+            # This rank's first element becomes the previous shard's local tail.
+            for tensor in tensors:
+                send_buffer = tensor.select(dims, 0).contiguous()
+                send_buffers.append(send_buffer)
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        send_buffer,
+                        contiguous_roll_plan.send_rank,
+                        group=contiguous_roll_plan.cp_group,
+                    )
+                )
+
+        works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
     rolled_tensors = [torch.roll(tensor, shifts=-1, dims=dims) for tensor in tensors]
     for work in works:
         work.wait()
@@ -1703,7 +1757,7 @@ def process_mtp_loss(
     is_training: bool,
     compute_language_model_loss: Callable,
     config: TransformerConfig,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup | LogicalCPGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
