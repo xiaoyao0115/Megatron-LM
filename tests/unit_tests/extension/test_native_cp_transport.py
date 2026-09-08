@@ -15,6 +15,7 @@ def _qwen35_config(**overrides):
         "kv_channels": 256,
         "params_dtype": torch.bfloat16,
         "num_moe_experts": 256,
+        "thd_max_packed_sequences": None,
         "experimental_attention_variant": "gdn",
         "linear_attention_freq": 4,
         "linear_num_key_heads": 16,
@@ -62,6 +63,26 @@ def test_attention_only_config_does_not_reserve_gdn_state():
 
 def test_explicit_hybrid_gdn_dimensions_reserve_state_before_layer_construction():
     config = _qwen35_config(experimental_attention_variant=None, linear_attention_freq=None)
+
+    payload_bytes = get_native_cp_payload_bytes(config, tp_size=1)
+
+    assert payload_bytes == 8 * 1024 * 1024
+
+
+def test_moe_aux_payload_scales_with_max_packed_sequences():
+    config = _qwen35_config(
+        max_seqlen_per_dp_cp_rank=1,
+        num_query_groups=1,
+        kv_channels=1,
+        thd_max_packed_sequences=2048,
+        experimental_attention_variant=None,
+        linear_attention_freq=None,
+        linear_num_key_heads=None,
+        linear_num_value_heads=None,
+        linear_key_head_dim=None,
+        linear_value_head_dim=None,
+        linear_conv_kernel_dim=None,
+    )
 
     payload_bytes = get_native_cp_payload_bytes(config, tp_size=1)
 
