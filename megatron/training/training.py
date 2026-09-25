@@ -2166,6 +2166,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2173,6 +2174,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -5139,6 +5141,9 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        config.thd_max_subsamples_per_item = (
+            1 if args.use_varlen_dataset else args.thd_max_packed_sequences
+        )
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -5147,6 +5152,9 @@ def train(
             optimizers=[optimizer],
             pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            dynamic_cp_group_getter=(
+                get_dynamic_data_context_parallel_groups if args.dynamic_context_parallel else None
+            ),
         )
 
     # Run training iterations till done.
@@ -5576,7 +5584,7 @@ def train(
             break
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph

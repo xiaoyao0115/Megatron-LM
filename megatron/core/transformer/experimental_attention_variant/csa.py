@@ -2184,6 +2184,15 @@ class CompressedSparseAttention(MegatronModule):
         if self.indexer is not None:
             self.indexer.backward_dw()
 
+    def _save_indexer_loss(self, loss, reduce_group=None):
+        """Save a local indexer metric; training supplies the stable DCP reduction domain."""
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=loss,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+            reduce_group=reduce_group,
+        )
+
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
@@ -2282,19 +2291,22 @@ class CompressedSparseAttention(MegatronModule):
             precision=precision,
         )
         capturing = torch.cuda.is_current_stream_capturing()
-        workspace = self._active_bshd_compact_indexer_workspace
-        if capturing:
-            if workspace is not None and workspace.matches_shape(**match_kwargs):
+        active_workspace = self._active_bshd_compact_indexer_workspace
+        if active_workspace is not None and active_workspace.matches_shape(**match_kwargs):
+            return active_workspace
+
+        for workspace in self._bshd_compact_indexer_workspaces:
+            if workspace is active_workspace:
+                continue
+            if workspace.matches_shape(**match_kwargs):
+                self._active_bshd_compact_indexer_workspace = workspace
                 return workspace
+
+        if capturing:
             raise ValueError(
                 "BSHD compact CUDA graph capture requires an eagerly prepared compact "
                 "workspace for the active static geometry. Run eager warmup before capture."
             )
-
-        for workspace in self._bshd_compact_indexer_workspaces:
-            if workspace.matches_shape(**match_kwargs):
-                self._active_bshd_compact_indexer_workspace = workspace
-                return workspace
 
         q_bshd = q.permute(1, 0, 2, 3).contiguous()
         k_bsd = k.permute(1, 0, 2).contiguous()
@@ -2520,11 +2532,7 @@ class CompressedSparseAttention(MegatronModule):
                         non_compressed_lse,
                     )
                     if indexer_loss_coeff > 0:
-                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                            loss=indexer_loss,
-                            layer_number=self.layer_number,
-                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                        )
+                        self._save_indexer_loss(indexer_loss)
                 else:
                     _, topk_indices_compressed = self.indexer(
                         x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
@@ -2704,11 +2712,7 @@ class CompressedSparseAttention(MegatronModule):
         nvtx_range_pop("sparse_attn_kernel")
 
         if indexer_loss_coeff > 0:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-            )
+            self._save_indexer_loss(indexer_loss)
         return output, indexer_loss
 
     # ------------------------------------------------------------------
@@ -2943,11 +2947,7 @@ class CompressedSparseAttention(MegatronModule):
                     )
 
                     if indexer_loss_coeff > 0:
-                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                            loss=indexer_loss,
-                            layer_number=self.layer_number,
-                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                        )
+                        self._save_indexer_loss(indexer_loss)
                 else:
                     _, topk_indices_cmp = self.indexer(
                         x_det, qr_det, mask=None, packed_seq_params=packed_seq_params
@@ -3268,11 +3268,7 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         if indexer_loss_coeff > 0:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-            )
+            self._save_indexer_loss(indexer_loss)
         output = output.unsqueeze(1)
         return output, indexer_loss
 
@@ -3825,12 +3821,7 @@ class CompressedSparseAttention(MegatronModule):
                 flat_shape = output.shape
                 output = out_rope.apply(output.reshape(l_local, np_local, -1)).reshape(flat_shape)
             if indexer_loss_coeff > 0:
-                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                    reduce_group=cp_group,
-                )
+                self._save_indexer_loss(indexer_loss, reduce_group=cp_group)
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output.unsqueeze(1)
 

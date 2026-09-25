@@ -545,11 +545,9 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             rope_first=rope_first,
             thd_global_start=thd_global_start,
         )
-        ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
-        ctx.has_position_ids = position_ids is not None
+        ctx.save_for_backward(cos, sin, position_ids, cu_seqlens_q)
         ctx.nope_dim = nope_dim
         ctx.emb_dim = emb_dim
-        ctx.cu_seqlens_q = cu_seqlens_q
         ctx.rotary_interleaved = rotary_interleaved
         ctx.inverse = inverse
         ctx.remove_interleaving = remove_interleaving
@@ -568,12 +566,8 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             grad: [seq_len, batch_size, head_num, nope_dim + emb_dim]
                 or [total_seq_len, head_num, nope_dim + emb_dim]
         """
-        if ctx.has_position_ids:
-            cos, sin, position_ids = ctx.saved_tensors
-        else:
-            cos, sin = ctx.saved_tensors
-            position_ids = None
-        if ctx.cu_seqlens_q is None or ctx.has_position_ids or ctx.thd_global_start is not None:
+        cos, sin, position_ids, cu_seqlens_q = ctx.saved_tensors
+        if cu_seqlens_q is None or position_ids is not None or ctx.thd_global_start is not None:
             grad = grad.contiguous()
 
         mla_rope_unapply_raw(
@@ -582,7 +576,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             sin,
             ctx.nope_dim,
             ctx.emb_dim,
-            cu_seqlens_q=ctx.cu_seqlens_q,
+            cu_seqlens_q=cu_seqlens_q,
             cp_rank=ctx.cp_rank,
             cp_size=ctx.cp_size,
             inverse=ctx.inverse,

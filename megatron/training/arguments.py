@@ -1201,9 +1201,7 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
-    if args.moe_megakernel_backend == "mok" and (
-        args.use_megatron_fsdp or args.use_torch_fsdp2
-    ):
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:
@@ -1581,6 +1579,11 @@ def validate_args(args, defaults={}):
             f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
             f'must be <= dp_size * cp_size ({dp_cp_size})'
         )
+        if (
+            args.cuda_graph_impl == 'transformer_engine'
+            and args.step_batch_size_schedule is not None
+        ):
+            raise ValueError('Dynamic CP CUDA graphs do not support step_batch_size_schedule.')
 
         import warnings
 

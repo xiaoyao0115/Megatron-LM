@@ -38,6 +38,9 @@ class ChunkCudaGraphBlockMixin:
 
     def _chunk_cp_group(self):
         """Explicit CP group of the captured block (the post-process block uses its owner's)."""
+        if self.config.dynamic_context_parallel:
+            _, cp_group = self._get_thd_cuda_graph_capture_cp()
+            return cp_group
         pg_collection = getattr(self, 'pg_collection', None)
         if pg_collection is None and getattr(self, '_owner', None) is not None:
             pg_collection = getattr(self._owner, 'pg_collection', None)
@@ -83,7 +86,8 @@ class ChunkCudaGraphBlockMixin:
             assert (
                 max_num_seqs is not None
             ), "thd_max_packed_sequences must be set for THD chunk CUDA graphs."
-            max_tokens = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+            capture_cp_size, _ = self._get_thd_cuda_graph_capture_cp()
+            max_tokens = config.max_seqlen_per_dp_cp_rank * capture_cp_size
             cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
             cu_seqlens[1:] = max_tokens
             static_inputs.update(
@@ -145,12 +149,16 @@ class ChunkCudaGraphBlockMixin:
         if self._block_uses_graph_dynamic_dsa_route():
             from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
-            cp_group = self._chunk_cp_group()
+            if self.config.dynamic_context_parallel:
+                # Replay selected and validated this exact captured group before removing
+                # PackedSeqParams from the tensor-only graph inputs.
+                cp_size = int(packed_seq_params.local_cp_size)
+                cp_group = packed_seq_params.cp_group
+            else:
+                cp_size = self.config.context_parallel_size
+                cp_group = self._chunk_cp_group()
             cp_balanced_indexer.validate_graph_dynamic_plan_contract(
-                packed_seq_params,
-                self.config.context_parallel_size,
-                cp_group.rank(),
-                self.config.max_seqlen_per_dp_cp_rank,
+                packed_seq_params, cp_size, cp_group.rank(), self.config.max_seqlen_per_dp_cp_rank
             )
             cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(
                 packed_seq_params, kwargs, required=True
@@ -162,10 +170,11 @@ class ChunkCudaGraphBlockMixin:
             return
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
+        capture_cp_size, capture_cp_group = self._get_thd_cuda_graph_capture_cp()
         graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
-            kwargs, self.config.context_parallel_size, self.config.max_seqlen_per_dp_cp_rank
+            kwargs, capture_cp_size, self.config.max_seqlen_per_dp_cp_rank
         )
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
@@ -175,6 +184,8 @@ class ChunkCudaGraphBlockMixin:
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            local_cp_size=capture_cp_size if self.config.dynamic_context_parallel else None,
+            cp_group=capture_cp_group if self.config.dynamic_context_parallel else None,
             pad_between_seqs=True,
         )
         if graph_dynamic_plan is not None:
@@ -277,21 +288,34 @@ class ChunkCudaGraphBlockMixin:
         if self.config.cuda_graph_granularity != "chunk":
             return super()._te_cuda_graph_replay(*args, **kwargs)
 
+        self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
         self._decompose_packed_seq_params_to_kwargs(kwargs)
         # Only tensors are graph inputs; a keyword that is None at runtime was not captured.
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
         microbatch_id = getattr(self, 'current_microbatch', 0)
-        # Without pipeline parallelism one slot serves every microbatch (a microbatch's backward
-        # completes before the next forward). With PP the capture holds one slot per microbatch,
-        # so the base replay's ``current_microbatch % len(cuda_graphs)`` must not wrap: reusing a
-        # slot whose backward has not retired would corrupt its static buffers.
-        assert self.config.pipeline_model_parallel_size == 1 or microbatch_id < len(
-            self.cuda_graphs
-        ), (
+        if (
+            not isinstance(microbatch_id, int)
+            or isinstance(microbatch_id, bool)
+            or microbatch_id < 0
+        ):
+            raise ValueError(
+                f"Chunk CUDA graph microbatch index must be non-negative: {microbatch_id!r}"
+            )
+        # PP1 retires backward before the next forward. Ordinary PP chunk graphs hold one slot
+        # per microbatch. DCP's slot plan instead proves a smaller ring against every permitted
+        # runtime schedule; only that published logical bound permits modulo slot reuse here.
+        replay_limit = len(self.cuda_graphs)
+        if (
+            self.config.dynamic_context_parallel
+            and self.config.cuda_graph_dynamic_microbatches
+            and self.cuda_graphs_by_dynamic_cp_size
+        ):
+            replay_limit = getattr(self.config, '_cuda_graph_num_microbatches', replay_limit)
+        assert self.config.pipeline_model_parallel_size == 1 or microbatch_id < replay_limit, (
             f"Chunk CUDA graph replay requested microbatch {microbatch_id}, but the capture only "
-            f"contains {len(self.cuda_graphs)} graph slots."
+            f"covers {replay_limit} logical microbatches with {len(self.cuda_graphs)} graph slots."
         )
         return super()._te_cuda_graph_replay(*args, **kwargs)
 
@@ -395,7 +419,8 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
         assert (
             max_num_seqs is not None
         ), "thd_max_packed_sequences must be set for THD chunk CUDA graphs."
-        max_tokens = tokens * config.context_parallel_size
+        capture_cp_size, _ = self._get_thd_cuda_graph_capture_cp()
+        max_tokens = tokens * capture_cp_size
         cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
         cu_seqlens[1:] = max_tokens
         inputs.update(

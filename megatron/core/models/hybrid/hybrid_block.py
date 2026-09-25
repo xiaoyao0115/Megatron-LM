@@ -208,6 +208,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             return static_inputs
+
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if group_tail is not None:
+            tail_inputs = group_tail.inner_layer.get_layer_static_inputs(
+                seq_length, micro_batch_size
+            )
+            if "input_ids" in tail_inputs:
+                static_inputs["input_ids"] = tail_inputs["input_ids"]
         hs = static_inputs["hidden_states"]
         n = self.config.num_residual_streams
         static_inputs["hidden_states"] = torch.ones(
@@ -256,11 +264,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """Reconstruct THD PackedSeqParams from tensor kwargs in the graph capture path."""
         if 'cu_seqlens_q' not in kwargs:
             return
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        capture_cp_size, capture_cp_group = self._get_thd_cuda_graph_capture_cp()
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
         graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
-            kwargs, self.config.context_parallel_size, self.config.max_seqlen_per_dp_cp_rank
+            kwargs, capture_cp_size, self.config.max_seqlen_per_dp_cp_rank
         )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
@@ -271,6 +280,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            local_cp_size=(capture_cp_size if self.config.dynamic_context_parallel else None),
+            cp_group=(capture_cp_group if self.config.dynamic_context_parallel else None),
             # This Python flag is baked into the captured graph and cannot vary
             # between replay batches. Use the conservative THD-safe branch.
             pad_between_seqs=True,
@@ -519,6 +530,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         expert offload is intentionally outside the Hybrid CUDA Graph support in this
         change, so this wrapper must not enter or flush that queue around replay.
         """
+        self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
         try:
             self._decompose_packed_seq_params_to_kwargs(kwargs)
             return self._te_cuda_graph_replay_impl(args, kwargs)
