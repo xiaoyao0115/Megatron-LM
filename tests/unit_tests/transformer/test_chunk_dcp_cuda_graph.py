@@ -221,7 +221,7 @@ def test_static_cp_chunk_keeps_pp_no_wrap_contract(block_type):
     assert not calls
 
 
-def _build_dcp_model(groups, mtp_layers):
+def _build_dcp_model(groups, mtp_layers, granularity="chunk", max_cp_size=None):
     config = TransformerConfig(
         num_layers=2,
         hidden_size=256,
@@ -242,8 +242,9 @@ def _build_dcp_model(groups, mtp_layers):
         pad_packed_seq_alignment="max",
         mtp_num_layers=mtp_layers or None,
         cuda_graph_impl="transformer_engine",
-        cuda_graph_granularity="chunk",
-        cuda_graph_modules=[],
+        cuda_graph_granularity=granularity,
+        cuda_graph_modules=[] if granularity == "chunk" else ["attn"],
+        max_dynamic_context_parallel_size=max_cp_size,
         cuda_graph_dynamic_microbatches=True,
     )
     spec = get_gpt_layer_with_transformer_engine_spec()
@@ -331,8 +332,23 @@ def _train_step(model, batch, microbatch):
 @pytest.mark.parametrize("mtp_layers", [0, 1])
 def test_chunk_dcp_capture_replay_matches_eager(mtp_layers, monkeypatch):
     """Real decoder, LM loss and optional MTP F/B across changing CP banks and packs."""
+    _check_dcp_capture_replay(mtp_layers, monkeypatch)
+
+
+@pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", "1")) != 4, reason="requires four ranks")
+@pytest.mark.parametrize("granularity", ["layer", "chunk"])
+def test_dynamic_cp_max_capture_replay_matches_eager(granularity, monkeypatch):
+    """CP1/2 native PG and graph banks must exclude the real four-rank DPxCP parent."""
+    _check_dcp_capture_replay(0, monkeypatch, granularity=granularity, max_cp_size=2)
+
+
+def _check_dcp_capture_replay(mtp_layers, monkeypatch, granularity="chunk", max_cp_size=None):
     Utils.destroy_model_parallel()
-    Utils.initialize_model_parallel(context_parallel_size=1, dynamic_context_parallel=True)
+    Utils.initialize_model_parallel(
+        context_parallel_size=1,
+        dynamic_context_parallel=True,
+        max_dynamic_context_parallel_size=max_cp_size,
+    )
     helper = None
     try:
         monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
@@ -349,8 +365,17 @@ def test_chunk_dcp_capture_replay_matches_eager(mtp_layers, monkeypatch):
             micro_batch_size=1,
             data_parallel_size=groups.dp.size(),
         )
-        model = _build_dcp_model(groups, mtp_layers)
-        sizes = tuple(2**exponent for exponent in range(groups.dp_cp.size().bit_length()))
+        model = _build_dcp_model(groups, mtp_layers, granularity, max_cp_size)
+        maximum = groups.dp_cp.size() if max_cp_size is None else max_cp_size
+        sizes = tuple(2**exponent for exponent in range(maximum.bit_length()))
+        if max_cp_size is not None:
+            assert groups.dp_cp.size() == 4
+            assert set(parallel_state._DYNAMIC_DP_CP_GROUPS) == set(sizes)
+            for size in sizes:
+                group = getter(group_size=size)
+                ranks = torch.distributed.get_process_group_ranks(group)
+                assert group.size() == size and ranks[0] % size == 0
+                assert ranks == list(range(ranks[0], ranks[0] + size))
         cases = [(size, lengths) for size in sizes for lengths in ((48,), (16, 32))]
         batches = [
             _dcp_batch(model.config, groups, size, lengths, index)
@@ -366,10 +391,14 @@ def test_chunk_dcp_capture_replay_matches_eager(mtp_layers, monkeypatch):
             pg_collection=groups,
             dynamic_cp_group_getter=getter,
         )
-        assert helper.flattened_callables == [model.decoder, model.postprocess_block]
+        if granularity == "chunk":
+            assert helper.flattened_callables == [model.decoder, model.postprocess_block]
+        else:
+            assert helper.flattened_callables == list(model.decoder.layers)
+        assert helper._get_dynamic_cp_capture_sizes() == tuple(reversed(sizes))
         helper.create_cudagraphs()
         assert helper.graphs_created()
-        for block in (model.decoder, model.postprocess_block):
+        for block in helper.flattened_callables:
             assert set(block.cuda_graphs_by_dynamic_cp_size) == set(sizes)
             assert all(len(bank) == 1 for bank in block.cuda_graphs_by_dynamic_cp_size.values())
 
@@ -386,14 +415,18 @@ def test_chunk_dcp_capture_replay_matches_eager(mtp_layers, monkeypatch):
         for microbatch, index in enumerate(order):
             before = len(replays)
             values, gradients = _train_step(model, batches[index], microbatch)
-            assert len(replays) - before >= 4, "decoder and post-process F/B must all replay"
+            assert (
+                len(replays) - before >= 4
+            ), "both captured modules must replay forward and backward"
             expected_values, expected_gradients = reference[index]
             torch.testing.assert_close(values, expected_values, rtol=1e-3, atol=1e-3)
             assert gradients.keys() == expected_gradients.keys()
             for name, expected in expected_gradients.items():
                 error = (gradients[name] - expected).norm()
                 assert error <= 2e-2 * expected.norm() + 1e-6, (name, index, error.item())
-        print(f"CHUNK_DCP_REPLAY_PASS mtp={mtp_layers} cp_sizes={sizes} microbatches={len(order)}")
+        print(
+            f"DCP_REPLAY_PASS granularity={granularity} mtp={mtp_layers} cp_sizes={sizes} microbatches={len(order)}"
+        )
     finally:
         torch.cuda.synchronize()
         if helper is not None:

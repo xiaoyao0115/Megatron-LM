@@ -1886,6 +1886,7 @@ class TECudaGraphHelper:
 
         self._thd_rotary_seq_lens = thd_rotary_seq_lens
         self._publish_thd_rotary_seq_lens(self._thd_rotary_seq_lens)
+        self._prepare_dsv4_thd_rotary_caches()
 
         # Flags to track CUDA Graph state:
         # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
@@ -2392,6 +2393,53 @@ class TECudaGraphHelper:
         for model_chunk in self.chunks_with_decoder:
             if model_chunk is not None:
                 model_chunk.config._cuda_graph_thd_rotary_seq_lens = rotary_seq_lens
+
+    def _prepare_dsv4_thd_rotary_caches(self):
+        """Materialize captured DSv4 attention RoPE caches before capture state is saved."""
+        if (
+            self.config.experimental_attention_variant != "dsv4_hybrid"
+            or self.config.sequence_packing_scheduler is None
+            or self.config.max_seqlen_per_dp_cp_rank is None
+            or not self.config.apply_rope_fusion
+        ):
+            return
+
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridAttention,
+        )
+
+        real_seq_len = (
+            self.thd_sequence_length_upper_bound
+            if self.thd_sequence_length_upper_bound is not None
+            else self.seq_length
+        )
+        max_seq_len = max([int(real_seq_len), *self._thd_rotary_seq_lens.values()])
+        rotary_caches = {}
+        for graph_callable in self.flattened_callables:
+            # This also includes non-registered group tails, while excluding eager
+            # attention outside a partial graph's scope. Chunk callables expose MTP.
+            for graph_module in graph_callable._get_submodules_under_cudagraphs():
+                for module in graph_module.modules():
+                    if not isinstance(module, DSv4HybridAttention):
+                        continue
+                    # Match GraphableMegatronModule.get_layer_static_inputs.
+                    if module.config.bf16:
+                        dtype = torch.bfloat16
+                    elif module.config.fp16:
+                        dtype = torch.float16
+                    else:
+                        dtype = torch.float32
+                    rotary = module.rotary_pos_emb
+                    if id(rotary) in rotary_caches:
+                        assert (
+                            rotary_caches[id(rotary)][1] == dtype
+                        ), "Shared DSv4 RoPE cache requires one capture activation dtype."
+                    else:
+                        rotary_caches[id(rotary)] = (rotary, dtype)
+
+        for rotary, dtype in rotary_caches.values():
+            # Use the original DSv4 attention key; its CSA/indexer aliases share it.
+            rotary.get_cached_cos_sin(max_seq_len, dtype=dtype, packed_seq=True, mscale=1.0)
 
     def _clear_thd_rotary_seq_lens(self):
         """Remove capture-only RoPE limits from every VPP config copy."""

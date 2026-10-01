@@ -36,7 +36,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def _pipeline_model(groups):
+def _pipeline_model(groups, recompute_lm_head=False):
     config = TransformerConfig(
         num_layers=4,
         hidden_size=256,
@@ -66,6 +66,8 @@ def _pipeline_model(groups):
         cuda_graph_granularity="chunk",
         cuda_graph_modules=[],
         cuda_graph_dynamic_microbatches=True,
+        recompute_granularity="selective" if recompute_lm_head else None,
+        recompute_modules=["lm_head"] if recompute_lm_head else None,
     )
     torch.manual_seed(123)
     model_parallel_cuda_manual_seed(123)
@@ -190,7 +192,8 @@ def _run_schedule(model, groups, batches, count, replay_slots):
     int(os.environ.get("WORLD_SIZE", "1")) < 4 or torch.cuda.device_count() < 4,
     reason="requires torchrun with at least 4 GPUs for PP2 and DCP2",
 )
-def test_chunk_dcp_pp2_vpp2_async_replay_matches_eager(monkeypatch):
+@pytest.mark.parametrize("recompute_lm_head", [False, True])
+def test_chunk_dcp_pp2_vpp2_async_replay_matches_eager(monkeypatch, recompute_lm_head):
     """Compare local losses/grads while graph-backed outputs are sent asynchronously.
 
     No optimizer update or DP reduction is needed: both executions use the same parameters
@@ -218,7 +221,7 @@ def test_chunk_dcp_pp2_vpp2_async_replay_matches_eager(monkeypatch):
             micro_batch_size=1,
             data_parallel_size=groups.dp.size(),
         )
-        model = _pipeline_model(groups)
+        model = _pipeline_model(groups, recompute_lm_head)
         batches = _pipeline_batches(model, groups, 12)
         references = {
             count: _run_schedule(model, groups, batches, count, defaultdict(list))
