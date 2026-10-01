@@ -26,6 +26,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.recompute import checkpoint_activations
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.chunk_cuda_graph import (
     ChunkCudaGraphPostProcessBlock,
@@ -155,6 +156,15 @@ class GPTModel(LanguageModule):
         vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
+
+        self.recompute_lm_head = (
+            config.recompute_granularity == "selective" and "lm_head" in config.recompute_modules
+        )
+        if self.recompute_lm_head:
+            if share_embeddings_and_output_weights:
+                raise ValueError("lm_head recompute currently requires untied output weights.")
+            if has_config_logger_enabled(config):
+                raise ValueError("lm_head recompute does not support config logging.")
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -758,6 +768,19 @@ class GPTModel(LanguageModule):
         the output layer, and computes language model loss when labels are provided.
         """
         in_inference_mode = InferenceMode.is_active()
+        recompute_lm_head = (
+            self.recompute_lm_head
+            and self.post_process
+            and self.training
+            and torch.is_grad_enabled()
+            and labels is not None
+            and not in_inference_mode
+        )
+        if recompute_lm_head:
+            if output_processor is not None or output_processor_context is not None:
+                raise ValueError("lm_head recompute does not support custom output processors.")
+            if has_config_logger_enabled(self.config):
+                raise ValueError("lm_head recompute does not support config logging.")
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
@@ -944,11 +967,35 @@ class GPTModel(LanguageModule):
                 labels=labels,
                 **output_layer_kwargs,
             )
+        elif recompute_lm_head:
+            if hidden_states.dtype != torch.bfloat16 or not hidden_states.requires_grad:
+                raise ValueError("lm_head recompute requires differentiable BF16 hidden states.")
+            if type(self.output_layer) is not LinearCrossEntropyModule:
+                raise ValueError("lm_head recompute requires the native GPT output layer.")
+
+            def head_forward(hidden, target):
+                # Only non-tensor options and the persistent model are closed over.
+                # Tensor inputs must go through the checkpoint's saved-tensor hooks.
+                return self._compute_lm_head_loss(hidden, target, runtime_gather_output)
+
+            # The shared dispatcher uses TE checkpoint for chunk graphs; the ordinary
+            # MCore checkpoint would skip recomputation during warmup and capture.
+            # Keep MTP, metric updates and other postprocess side effects outside.
+            loss = checkpoint_activations(
+                self.config, head_forward, False, self.pg_collection.tp, hidden_states, labels
+            )
         else:
             logits, _ = self.output_layer(**output_layer_kwargs)
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    def _compute_lm_head_loss(self, hidden_states, labels, runtime_gather_output):
+        """Deterministic untied training head; no MTP, logging or mutable forward buffers."""
+        logits, _ = self.output_layer(
+            hidden_states, weight=None, runtime_gather_output=runtime_gather_output
+        )
+        return self.compute_language_model_loss(labels, logits)
 
     def build_schedule_plan(
         self,

@@ -698,7 +698,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn", "gdn_norm_out".
+             "shared_experts", "mhc", "gdn", "gdn_norm_out", "lm_head".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -713,11 +713,15 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GDN-family layer, including GatedDeltaNet and KDA
             (input projections, conv1d, gated delta rule, gated norm, CP all-to-all, and
             out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
+    "lm_head": recompute GPT's final output projection and native cross entropy during
+            backward. Initially supports BF16, TP1, untied weights, no MTP, and eager or
+            Transformer Engine CUDA graphs. Fused loss, deferred wgrad, quantization,
+            custom output processors and config logging are not supported.
     "gdn_norm_out": recompute gated output normalization and layout restoration for
             Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
     "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
     output-discarding checkpointing,
-    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", "gdn", and "lm_head" use normal checkpointing.
     """
 
     ####################
@@ -2716,6 +2720,34 @@ class TransformerConfig(ModelParallelConfig):
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
 
+        if "lm_head" in self.recompute_modules:
+            if self.recompute_granularity != "selective":
+                raise ValueError("lm_head recompute requires recompute_granularity='selective'.")
+            if self.params_dtype != torch.bfloat16:
+                raise ValueError("lm_head recompute currently requires BF16 parameters.")
+            if self.tensor_model_parallel_size != 1 or self.sequence_parallel:
+                raise ValueError(
+                    "lm_head recompute currently requires TP1 without sequence parallel."
+                )
+            if self.fp8 or self.fp4 or self.fp8_param or self.fp4_param or self.quant_recipe:
+                raise ValueError("lm_head recompute does not support FP8/FP4 or quantization.")
+            if self.mtp_num_layers:
+                raise ValueError("lm_head recompute does not yet support MTP.")
+            if self.cross_entropy_loss_fusion:
+                raise ValueError("lm_head recompute requires native unfused cross entropy.")
+            if self.defer_embedding_wgrad_compute or self.delay_wgrad_compute:
+                raise ValueError("lm_head recompute does not support deferred weight gradients.")
+            if self.distribute_saved_activations or self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "lm_head recompute does not support activation sharding or offloading."
+                )
+            if self.cuda_graph_impl not in ("none", "transformer_engine"):
+                raise ValueError(
+                    "lm_head recompute supports eager or Transformer Engine CUDA graphs."
+                )
+            if self.use_mup:
+                raise ValueError("lm_head recompute does not yet support MuP.")
+
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
@@ -2729,6 +2761,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc",
                     "gdn",
                     "gdn_norm_out",
+                    "lm_head",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (

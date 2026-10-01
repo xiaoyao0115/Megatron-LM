@@ -191,6 +191,36 @@ checkpoint node while a graph is warmed up or captured and would silently keep t
 Recompute built on `CheckpointWithoutOutput` (`layernorm`, `moe_act`, `mla_up_proj`, `gdn_norm_out`,
 `mhc`) keeps its own hook mechanism, which registers the recompute inside the capture as is.
 
+### Selective LM-head recompute
+
+For a BF16 GPT model, `lm_head` selective recompute saves the final hidden states and
+labels instead of retaining the output projection and vocabulary softmax activations
+until backward. The original output projection and native cross entropy run again
+inside backward; the loss, masking and gradient scaling are unchanged. This trades an
+additional head forward for lower activation storage and does not promise a particular
+whole-device memory reduction.
+
+```bash
+--recompute-granularity selective \
+--recompute-modules lm_head
+```
+
+Append `lm_head` to any existing selective module list that the recipe needs, for example
+`--recompute-modules moe_act layernorm lm_head`. It applies to the main training loss on
+the last pipeline stage; evaluation and logits-only inference keep the ordinary path.
+MTP and other postprocess effects are outside the recompute region.
+
+The initial implementation requires TP1, BF16 parameters/hidden states, untied output
+weights, no MTP, and native unfused cross entropy. It supports eager execution and
+Transformer Engine per-layer or chunk CUDA graphs. Chunk graphs use TE's checkpoint
+through the shared recompute dispatcher, because the ordinary MCore checkpoint skips
+its node during graph warmup/capture. The hidden input must require gradients in
+training. FP8/FP4 or other quantization, sequence parallelism, fused cross entropy,
+deferred weight gradients, activation sharding/offloading, MuP, custom output processors,
+and config logging are rejected when this option is enabled. `local` and `full_iteration`
+graph implementations are not yet supported for this option. At TP1, the training CLI
+normalizes `--sequence-parallel` off before constructing the model config.
+
 **DSA compact-indexer workspace.** With CUDA graphs the fused compact DSA indexer (`--dsa-kernel-backend cudnn`,
 `--dsa-indexer-precision mxfp8`) keeps a persistent workspace per static geometry: the MXFP8 q/k quantization
 destinations, packed scales and candidate offsets have to be prepared in eager warm-up because their sizing
