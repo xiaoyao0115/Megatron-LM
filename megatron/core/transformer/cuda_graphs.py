@@ -3007,6 +3007,7 @@ class TECudaGraphHelper:
         min_cp_size=1,
         max_subsamples_per_item=1,
         microbatch_group_size_per_vp_stage=None,
+        max_cp_size=None,
     ):
         """Return the scheduler-derived microbatch upper bound for dynamic CP.
 
@@ -3026,6 +3027,10 @@ class TECudaGraphHelper:
         raw_required_cp_size = math.ceil(max_sequence_length / max_seqlen_per_dp_cp_rank)
         rounded_required_cp_size = 1 << (raw_required_cp_size - 1).bit_length()
         max_required_cp_size = min(total_dcp_gpus, max(min_cp_size, rounded_required_cp_size))
+        if max_cp_size is not None and max_cp_size < total_dcp_gpus:
+            # A reserved capped tail may expand short samples beyond their minimum CP
+            # width. Every full microbatch still needs at least parent / cap samples.
+            max_required_cp_size = max_cp_size
         subsamples_per_microbatch = max(1, total_dcp_gpus // max_required_cp_size)
         max_subsamples = global_batch_size * max_subsamples_per_item
         max_num_microbatches = math.ceil(max_subsamples / subsamples_per_microbatch)
@@ -3057,6 +3062,7 @@ class TECudaGraphHelper:
                     if self.config.virtual_pipeline_model_parallel_size is None
                     else microbatch_group_size_per_vp_stage
                 ),
+                max_cp_size=getattr(self.config, 'max_dynamic_context_parallel_size', None),
             )
             return (max_num_microbatches, "dynamic_cp_scheduler_upper_bound")
         dp_size = self.dp_group.size()
@@ -3469,10 +3475,14 @@ class TECudaGraphHelper:
 
     def _get_dynamic_cp_capture_sizes(self):
         """Return dynamic CP sizes in capture order."""
-        max_size = self.dp_cp_group.size()
+        parent_size = self.dp_cp_group.size()
+        max_size = getattr(self.config, 'max_dynamic_context_parallel_size', None)
+        max_size = parent_size if max_size is None else max_size
         min_size = self.config.min_dynamic_context_parallel_size
-        if min_size > max_size or any(
-            size < 1 or size & (size - 1) for size in (min_size, max_size)
+        if (
+            max_size > parent_size
+            or min_size > max_size
+            or any(size < 1 or size & (size - 1) for size in (min_size, max_size))
         ):
             raise ValueError("Dynamic CP graph sizes must be powers of two with min <= max.")
         largest, smallest = (int(math.log2(size)) for size in (max_size, min_size))

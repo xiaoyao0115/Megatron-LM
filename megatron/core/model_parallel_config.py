@@ -90,7 +90,11 @@ class ModelParallelConfig:
 
     min_dynamic_context_parallel_size: int = 1
     """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
-    The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
+    By default the maximum is the full DPxCP group; an explicit maximum can limit it."""
+
+    max_dynamic_context_parallel_size: Optional[int] = None
+    """Maximum power-of-two CP group size for dynamic context parallel.
+    None preserves the full DPxCP parent as the maximum."""
 
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
@@ -563,6 +567,20 @@ class ModelParallelConfig:
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
                 )
+            if self.max_dynamic_context_parallel_size is not None:
+                maximum = self.max_dynamic_context_parallel_size
+                if (
+                    maximum < 1
+                    or maximum & (maximum - 1)
+                    or self.min_dynamic_context_parallel_size
+                    & (self.min_dynamic_context_parallel_size - 1)
+                ):
+                    raise ValueError("Dynamic context parallel size limits must be powers of two.")
+                if maximum < self.min_dynamic_context_parallel_size:
+                    raise ValueError(
+                        "max_dynamic_context_parallel_size must be >= "
+                        "min_dynamic_context_parallel_size."
+                    )
 
         if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
             raise ValueError(

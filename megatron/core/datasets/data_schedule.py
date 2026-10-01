@@ -426,12 +426,22 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
     Dynamic CP scheduler that balances workload across variable CP sizes.
     """
 
-    def __init__(self, *args, min_cp_size=1, **kwargs):
+    def __init__(self, *args, min_cp_size=1, max_cp_size=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
         self.min_cp_size = min_cp_size
+        self.max_cp_size = max_cp_size
+        if max_cp_size is not None and (
+            max_cp_size < min_cp_size
+            or max_cp_size > self.total_hdp_gpus
+            or max_cp_size & (max_cp_size - 1)
+            or min_cp_size < 1
+            or min_cp_size & (min_cp_size - 1)
+            or self.total_hdp_gpus % max_cp_size
+        ):
+            raise ValueError("Dynamic CP limits must be powers of two within the DPxCP parent.")
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -444,14 +454,24 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         sample_id_groups = []
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
 
+        maximum = self.total_hdp_gpus if self.max_cp_size is None else self.max_cp_size
+        min_groups = (self.total_hdp_gpus + maximum - 1) // maximum
         while sample_id_seqlens:
+            reserved_tail = []
+            if maximum < self.total_hdp_gpus and len(sample_id_seqlens) >= 2 * min_groups:
+                # Preserve enough independent samples to fill a final capped microbatch.
+                reserved_tail = sample_id_seqlens[-min_groups:]
+                sample_id_seqlens = sample_id_seqlens[:-min_groups]
             _, sample_id_seqlens, _, sample_ids = next_hdp_group_packing_aware(
                 sample_id_seqlens,
                 self.total_hdp_gpus,
                 max_seq_len_per_rank=mslpr,
                 min_cp_size=min_cp,
                 max_num_seqs=self.max_num_seqs,
+                max_cp_size=self.max_cp_size,
             )
+            sample_id_seqlens.extend(reserved_tail)
+            sample_id_seqlens.sort(key=lambda item: item[1], reverse=True)
             sample_id_groups.append(sample_ids)
 
         if (
@@ -459,7 +479,9 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
             and self.microbatch_group_size_per_vp_stage > 1
         ):
             sample_id_groups = align_sample_id_groups(
-                sample_id_groups, self.microbatch_group_size_per_vp_stage
+                sample_id_groups,
+                self.microbatch_group_size_per_vp_stage,
+                max_cp_size=self.max_cp_size,
             )
 
         return sample_id_groups
@@ -542,6 +564,7 @@ def wrap_data_iterator(
     scheduler_kwargs = {}
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
+        scheduler_kwargs['max_cp_size'] = getattr(config, 'max_dynamic_context_parallel_size', None)
 
     scheduler_max_num_seqs = _get_scheduler_max_real_num_seqs(config)
 

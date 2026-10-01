@@ -1579,6 +1579,21 @@ def validate_args(args, defaults={}):
             f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
             f'must be <= dp_size * cp_size ({dp_cp_size})'
         )
+        max_dynamic_cp_size = getattr(args, 'max_dynamic_context_parallel_size', None)
+        if max_dynamic_cp_size is not None:
+            assert (
+                max_dynamic_cp_size >= args.min_dynamic_context_parallel_size
+                and max_dynamic_cp_size <= dp_cp_size
+                and not max_dynamic_cp_size & (max_dynamic_cp_size - 1)
+                and args.min_dynamic_context_parallel_size >= 1
+                and not args.min_dynamic_context_parallel_size
+                & (args.min_dynamic_context_parallel_size - 1)
+                and dp_cp_size % max_dynamic_cp_size == 0
+            ), (
+                'max_dynamic_context_parallel_size must be a power of two between '
+                'min_dynamic_context_parallel_size and dp_size * cp_size, '
+                'and divide dp_size * cp_size'
+            )
         if (
             args.cuda_graph_impl == 'transformer_engine'
             and args.step_batch_size_schedule is not None
@@ -1590,10 +1605,9 @@ def validate_args(args, defaults={}):
         warnings.warn(
             f"Dynamic CP enabled: dp_size * context_parallel_size="
             f"{args.data_parallel_size * args.context_parallel_size} "
-            f"will be used as the maximum dynamic CP group size. "
             f"Dynamic CP groups will range from "
             f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
-            f"to {args.data_parallel_size * args.context_parallel_size}."
+            f"to {max_dynamic_cp_size or dp_cp_size}."
         )
 
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:

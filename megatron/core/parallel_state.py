@@ -418,14 +418,28 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1, max_cp_size=None):
     """
     Creates groups required for dynamic DPxCP.
-    Creates a new group for every power of 2 from min_cp_size up to len(ranks).
+    Creates power-of-two groups from min_cp_size through the optional maximum.
+    The existing full DPxCP group is reused when it is within that range.
     Returns a dictionary indexed by group size.
     """
     dynamic_dp_cp_groups = {}
-    group_sizes = [2**i for i in range(int(log2(len(ranks)))) if 2**i >= min_cp_size]
+    if max_cp_size is not None and (
+        max_cp_size < min_cp_size
+        or max_cp_size > len(ranks)
+        or max_cp_size & (max_cp_size - 1)
+        or min_cp_size < 1
+        or min_cp_size & (min_cp_size - 1)
+        or len(ranks) % max_cp_size
+    ):
+        raise ValueError(
+            "max_dynamic_context_parallel_size must be a power of two between the minimum "
+            "and the DPxCP parent size, and divide the parent size."
+        )
+    maximum = len(ranks) if max_cp_size is None else max_cp_size
+    group_sizes = [2**i for i in range(int(log2(len(ranks)))) if min_cp_size <= 2**i <= maximum]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
@@ -447,9 +461,7 @@ class RankGenerator(object):
     def __init__(
         self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -565,6 +577,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    max_dynamic_context_parallel_size: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -627,6 +640,10 @@ def initialize_model_parallel(
             all-reduce is required in backward. For simplicity, we piggyback
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
+
+        max_dynamic_context_parallel_size (int, optional):
+            Upper bound for native power-of-two Dynamic CP subgroups. None uses
+            the full DPxCP parent. An explicit cap must divide the parent size.
 
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
@@ -931,6 +948,7 @@ def initialize_model_parallel(
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
+                    max_cp_size=max_dynamic_context_parallel_size,
                 )
             )
 
@@ -939,8 +957,15 @@ def initialize_model_parallel(
             2**i
             for i in range(int(log2(data_parallel_size_with_cp)))
             if 2**i >= min_dynamic_context_parallel_size
+            and (
+                max_dynamic_context_parallel_size is None
+                or 2**i <= max_dynamic_context_parallel_size
+            )
         ]
-        if data_parallel_size_with_cp not in group_sizes:
+        if data_parallel_size_with_cp not in group_sizes and (
+            max_dynamic_context_parallel_size is None
+            or data_parallel_size_with_cp <= max_dynamic_context_parallel_size
+        ):
             group_sizes.append(data_parallel_size_with_cp)
         for group_size in group_sizes:
             group = get_dynamic_data_context_parallel_groups(group_size=group_size)

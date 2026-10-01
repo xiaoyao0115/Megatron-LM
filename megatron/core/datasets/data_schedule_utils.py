@@ -609,12 +609,32 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
 # =============================================================================
 
 
+def _capped_cp_group_sizes(current_sizes: Tuple[int, ...], parent_size: int, maximum: int):
+    """Expand descending power-of-two groups into a canonical tiling within the cap."""
+
+    @lru_cache(None)
+    def choose(index, start, previous):
+        if index == len(current_sizes):
+            return () if start == parent_size else None
+        size = min(maximum, previous)
+        while size >= current_sizes[index]:
+            if start % size == 0 and start + size <= parent_size:
+                suffix = choose(index + 1, start + size, size)
+                if suffix is not None:
+                    return (size,) + suffix
+            size //= 2
+        return None
+
+    return choose(0, 0, maximum)
+
+
 def next_hdp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
     max_num_seqs: Optional[int] = None,
+    max_cp_size: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -628,7 +648,9 @@ def next_hdp_group_packing_aware(
     The scheduler keeps the legacy invariant that each returned microbatch has
     no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank. ``max_num_seqs`` optionally caps the real sequences per subgroup.
+    every rank. An explicit ``max_cp_size`` instead requires canonical subgroups within
+    that cap and raises when this packing cannot fill the parent without repeating samples.
+    ``max_num_seqs`` optionally caps the real sequences per subgroup.
     """
     if not sample_seqlens:
         return (
@@ -638,8 +660,27 @@ def next_hdp_group_packing_aware(
             [[] for _ in range(total_gpus)],
         )
 
+    maximum = total_gpus if max_cp_size is None else max_cp_size
+    if max_cp_size is not None and (
+        maximum < min_cp_size
+        or maximum > total_gpus
+        or maximum & (maximum - 1)
+        or min_cp_size < 1
+        or min_cp_size & (min_cp_size - 1)
+        or total_gpus % maximum
+    ):
+        raise ValueError(
+            "max_cp_size must be a power of two within the CP range and divide the parent."
+        )
+    capped = maximum < total_gpus
+
     def cp_min_fn(seq_len: int) -> int:
-        return dcp_gpus_needed(seq_len, max_seq_len_per_rank, min_cp_size)
+        required = dcp_gpus_needed(seq_len, max_seq_len_per_rank, min_cp_size)
+        if capped and required > maximum:
+            raise ValueError(
+                f"Sequence length {seq_len} requires CP size {required}, exceeding max_cp_size={maximum}."
+            )
+        return required
 
     def workload(seq_len: int, cp_size: int) -> float:
         return (seq_len * seq_len) / cp_size
@@ -683,7 +724,7 @@ def next_hdp_group_packing_aware(
         best = None
 
         cp_size = min_needed
-        while cp_size <= total_gpus:
+        while cp_size <= maximum:
             per_gpu_cost = workload(seq_len, cp_size)
 
             for group_id, size in list(group_size.items()):
@@ -710,14 +751,29 @@ def next_hdp_group_packing_aware(
                 for rank, assigned_group_id in enumerate(gpu_group_id)
                 if assigned_group_id is None
             ]
-            if len(free_ranks) >= cp_size:
-                chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
+            if capped:
+                candidates = [
+                    list(range(start, start + cp_size))
+                    for start in range(0, total_gpus, cp_size)
+                    if all(gpu_group_id[rank] is None for rank in range(start, start + cp_size))
+                ]
+            else:
+                candidates = (
+                    [sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]]
+                    if len(free_ranks) >= cp_size
+                    else []
+                )
+            for chosen_members in candidates:
                 chosen_set = set(chosen_members)
                 projected_max = max(
                     time + per_gpu_cost if rank in chosen_set else time
                     for rank, time in enumerate(exec_times)
                 )
-                if projected_max <= cap and (best is None or projected_max < best[0]):
+                if projected_max <= cap and (
+                    best is None
+                    or projected_max < best[0]
+                    or (capped and projected_max == best[0] and best[2] == "add")
+                ):
                     best = (projected_max, cp_size, "new", None, chosen_members)
 
             cp_size *= 2
@@ -762,6 +818,8 @@ def next_hdp_group_packing_aware(
             return False
         min_group_size = min(existing_group_sizes)
         next_power = min(min_group_size * 2, total_gpus)
+        if next_power > maximum:
+            return False
 
         for group_id, size in list(group_size.items()):
             if size != min_group_size:
@@ -820,8 +878,61 @@ def next_hdp_group_packing_aware(
 
         return False
 
+    def repack_groups_to_fill_parent() -> bool:
+        """Expand existing groups into a complete canonical tiling, if possible."""
+        nonlocal micro_batches, exec_times, sample_ids_per_gpu
+        nonlocal gpu_group_id, group_members, group_size, packing_sequence_len
+
+        ordered_group_ids = sorted(
+            group_size, key=lambda group_id: (-group_size[group_id], group_members[group_id][0])
+        )
+        current_sizes = tuple(group_size[group_id] for group_id in ordered_group_ids)
+        selected_sizes = _capped_cp_group_sizes(current_sizes, total_gpus, maximum)
+        if selected_sizes is None:
+            return False
+
+        new_micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
+        new_exec_times: List[float] = [0.0 for _ in range(total_gpus)]
+        new_sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
+        new_gpu_group_id: List[Optional[int]] = [None] * total_gpus
+        new_group_members: Dict[int, List[int]] = {}
+        new_group_size: Dict[int, int] = {}
+        new_packing_sequence_len: Dict[int, float] = {}
+
+        start_rank = 0
+        for group_id, selected_size in zip(ordered_group_ids, selected_sizes):
+            old_first_rank = group_members[group_id][0]
+            lengths = list(micro_batches[old_first_rank])
+            sample_ids = list(sample_ids_per_gpu[old_first_rank])
+            members = list(range(start_rank, start_rank + selected_size))
+            per_rank_work = sum(workload(length, selected_size) for length in lengths)
+
+            new_group_members[group_id] = members
+            new_group_size[group_id] = selected_size
+            new_packing_sequence_len[group_id] = sum(length / selected_size for length in lengths)
+            for rank in members:
+                new_micro_batches[rank] = list(lengths)
+                new_exec_times[rank] = per_rank_work
+                new_sample_ids_per_gpu[rank] = list(sample_ids)
+                new_gpu_group_id[rank] = group_id
+            start_rank += selected_size
+
+        micro_batches = new_micro_batches
+        exec_times = new_exec_times
+        sample_ids_per_gpu = new_sample_ids_per_gpu
+        gpu_group_id = new_gpu_group_id
+        group_members = new_group_members
+        group_size = new_group_size
+        packing_sequence_len = new_packing_sequence_len
+        return True
+
     def fill_with_full_dpxcp_group() -> None:
         nonlocal micro_batches, exec_times, sample_ids_per_gpu, leftovers
+        if capped:
+            raise ValueError(
+                f"Cannot fill all {total_gpus} DPxCP ranks within max_cp_size={maximum}; "
+                "increase the global batch size or the maximum CP size."
+            )
 
         selected: List[Tuple[int, int]] = []
         next_leftovers: List[Tuple[int, int]] = []
@@ -851,22 +962,128 @@ def next_hdp_group_packing_aware(
         sample_ids_per_gpu = [list(selected_ids) for _ in range(total_gpus)]
         leftovers = next_leftovers
 
+    if capped:
+        if not repack_groups_to_fill_parent():
+            fill_with_full_dpxcp_group()
     while any(not micro_batch for micro_batch in micro_batches):
         if not fill_empty_gpus_once():
             fill_with_full_dpxcp_group()
             break
 
+    # A capped CP bank needs at least ceil(parent / max_cp) independent groups to
+    # occupy the parent. If fewer samples remain, they cannot form another valid
+    # microbatch. Fold that final tail into compatible existing groups while still
+    # respecting token and sequence-count capacity; only the workload-balance cap is
+    # relaxed for this terminal correction.
+    min_groups_for_capped_parent = ceil(total_gpus / maximum)
+    if capped and 0 < len(leftovers) < min_groups_for_capped_parent:
+        unplaced_leftovers: List[Tuple[int, int]] = []
+        for sample_id, seq_len in leftovers:
+            min_needed = cp_min_fn(seq_len)
+            best_group = None
+            for group_id, cp_size in group_size.items():
+                if cp_size < min_needed:
+                    continue
+                first_rank = group_members[group_id][0]
+                if max_num_seqs is not None and len(micro_batches[first_rank]) >= max_num_seqs:
+                    continue
+                if packing_sequence_len[group_id] + seq_len / cp_size > max_seq_len_per_rank:
+                    continue
+                per_gpu_cost = workload(seq_len, cp_size)
+                projected_max = max(
+                    time + per_gpu_cost if rank in group_members[group_id] else time
+                    for rank, time in enumerate(exec_times)
+                )
+                if best_group is None or projected_max < best_group[0]:
+                    best_group = (projected_max, group_id, cp_size)
+
+            if best_group is None:
+                unplaced_leftovers.append((sample_id, seq_len))
+                continue
+
+            _, group_id, cp_size = best_group
+            packing_sequence_len[group_id] += seq_len / cp_size
+            per_gpu_cost = workload(seq_len, cp_size)
+            for rank in group_members[group_id]:
+                micro_batches[rank].append(seq_len)
+                exec_times[rank] += per_gpu_cost
+                sample_ids_per_gpu[rank].append(sample_id)
+        leftovers = unplaced_leftovers
+
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
-def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_stage: int) -> List:
+def align_sample_id_groups(
+    sample_id_groups: List,
+    microbatch_group_size_per_vp_stage: int,
+    max_cp_size: Optional[int] = None,
+) -> List:
     """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
 
-    Standalone version extracted from DefaultDynamicCPScheduler.
+    Standalone version extracted from DefaultDynamicCPScheduler. With a CP cap, this
+    splits and redistributes existing packed groups to reach the next VPP multiple.
+    It raises if that expansion cannot fit; it does not search for a smaller globally
+    repacked schedule, which can be feasible even when expansion fails.
     """
     multiple = int(microbatch_group_size_per_vp_stage)
     remainder = (-len(sample_id_groups)) % multiple
     i = len(sample_id_groups) - 1
+
+    if remainder and max_cp_size is not None and max_cp_size < len(sample_id_groups[0]):
+        parent_size = len(sample_id_groups[0])
+        target_count = len(sample_id_groups) + remainder
+        minimum_groups = parent_size // max_cp_size
+        groups = []
+        for microbatch in sample_id_groups:
+            rank = 0
+            while rank < parent_size:
+                ids = microbatch[rank]
+                size = sum(ids[0] in rank_ids for rank_ids in microbatch)
+                if size > max_cp_size:
+                    raise ValueError("VPP alignment received a group larger than max_cp_size.")
+                groups.append((size, list(ids)))
+                rank += size
+        # Split packed groups only as needed to populate each capped microbatch.
+        # Each subset retains at least its original CP width, so its tokens still fit.
+        while len(groups) < target_count * minimum_groups:
+            for index, (size, ids) in enumerate(groups):
+                if len(ids) > 1:
+                    groups[index] = (size, ids[:-1])
+                    groups.append((size, ids[-1:]))
+                    break
+            else:
+                raise ValueError(
+                    "Cannot expand the current packing to the next VPP multiple within max_cp_size without duplicating "
+                    "real samples; increase the global batch size or maximum CP size."
+                )
+        groups.sort(key=lambda group: -group[0])
+        buckets = [[] for _ in range(target_count)]
+        widths = [0] * target_count
+        for size, ids in groups:
+            candidates = [
+                index for index, bucket in enumerate(buckets) if len(bucket) < minimum_groups
+            ]
+            if candidates:
+                index = min(candidates, key=lambda index: (len(buckets[index]), widths[index]))
+            else:
+                index = min(range(target_count), key=lambda index: widths[index])
+            if widths[index] + size > parent_size:
+                raise ValueError("Cannot align capped CP groups within the DPxCP parent capacity.")
+            buckets[index].append((size, ids))
+            widths[index] += size
+        aligned = []
+        for bucket in buckets:
+            sizes = _capped_cp_group_sizes(
+                tuple(size for size, _ in bucket), parent_size, max_cp_size
+            )
+            if sizes is None:
+                raise ValueError(
+                    "Cannot tile the DPxCP parent within max_cp_size for VPP alignment."
+                )
+            aligned.append(
+                [list(ids) for (_, ids), size in zip(bucket, sizes) for _ in range(size)]
+            )
+        return aligned
 
     def split_group(sample_id_group, allow_packed_full_group=False):
         total_hdp_ranks = len(sample_id_group)
@@ -952,6 +1169,11 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
         if i < 0:
             if attempts_since_split >= len(sample_id_groups):
                 if allow_packed_full_group:
+                    if max_cp_size is not None:
+                        raise ValueError(
+                            "Cannot expand the current packing to the next VPP multiple within max_cp_size without duplicating "
+                            "real samples; increase the global batch size or maximum CP size."
+                        )
                     assert (
                         False
                     ), 'align_sample_id_groups: no tail microbatch has enough ids to split'
