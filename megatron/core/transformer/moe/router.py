@@ -943,18 +943,20 @@ class TopKRouter(Router):
                 qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
                 topk_indices=topk_indices,
+                # Checkpoint forward runs without gradients even while training.
+                sort_topk=True if self.training else None,
             )
 
-        # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
-        # rows before dispatch. Other dispatchers retain their existing fixed-route
-        # assumptions until they support sparse routing maps end to end.
-        use_dropless_hybridep = (
+        # HybridEP consumes the sparse routing map directly, including with a static
+        # expert-rank budget. Padding must not consume that budget and displace real
+        # tokens. Per-expert drop-and-pad and other dispatchers retain their existing
+        # fixed-route assumptions.
+        use_sparse_hybridep = (
             self.config.moe_token_dispatcher_type == "flex"
             and self.config.moe_flex_dispatcher_backend == "hybridep"
             and self.config.moe_expert_capacity_factor is None
-            and self.config.moe_expert_rank_capacity_factor is None
         )
-        if padding_mask is not None and use_dropless_hybridep:
+        if padding_mask is not None and use_sparse_hybridep:
             valid_tokens = (~padding_mask).unsqueeze(-1)
             probs = probs * valid_tokens
             if routing_map.dtype == torch.bool:
@@ -963,6 +965,7 @@ class TopKRouter(Router):
                 routing_map = routing_map.masked_fill(padding_mask.unsqueeze(-1), -1)
 
         # Apply token dropping to probs and routing_map.
+        selected_routing_map = routing_map
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
                 probs,
@@ -1014,7 +1017,12 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        expert_bias_routing_map = routing_map
+        if self.enable_expert_bias and self.config.moe_pad_expert_input_to_capacity:
+            # Dispatch padding adds zero-probability entries for unselected experts.
+            # Count only selected routes that survived capacity, as in unpadded dispatch.
+            expert_bias_routing_map = routing_map & selected_routing_map
+        self._apply_expert_bias(expert_bias_routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
 

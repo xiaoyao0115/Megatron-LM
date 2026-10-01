@@ -1465,7 +1465,7 @@ class PagedStashRunner:
             if hasattr(mlp, 'token_dispatcher') and hasattr(
                 mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
             ):
-                mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
+                mlp.token_dispatcher._comm_manager.disable_expert_rank_capacity()
                 mlp.token_dispatcher.reset_over_budget()
         if self.stash_manager.overflow is not None:
             self.stash_manager.overflow.zero_()

@@ -1130,6 +1130,21 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
+    def disable_expert_rank_capacity(self) -> None:
+        """Remove the rank capacity after the previous forward/backward attempt finished.
+
+        Static budgets survive combine so CUDA graph replay can reuse them. A retry
+        changes that contract: dispatch must obtain a new dynamic size and expert
+        histogram, including on its first microbatch.
+        """
+        self.moe_expert_rank_capacity_factor = None
+        self.num_permuted_tokens = None
+        self.tokens_per_expert = None
+        self.pad_multiple = None
+        self.handle = None
+        self._original_num_tokens = None
+        self._padded_num_tokens = None
+
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
@@ -1234,6 +1249,31 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
+
+    def restore_dispatch_token_counts(self, hidden_states: torch.Tensor) -> None:
+        """Restore host counts when a partial graph replays preprocessing.
+
+        Combine clears these integers, while graph replay restores only routing
+        tensors. Their current shapes and the current dispatch input contain the
+        original and padded row counts; no tensor values or capacity change.
+        """
+        if self._original_num_tokens is not None and self._padded_num_tokens is not None:
+            return
+        if self._original_num_tokens is not None or self._padded_num_tokens is not None:
+            raise RuntimeError("HybridEP dispatch has incomplete host token counts")
+        if hidden_states.ndim != 2 or self.token_probs is None or self.token_probs.ndim != 2:
+            raise RuntimeError("HybridEP replay requires matrix hidden states and probabilities")
+        original_rows, padded_rows = hidden_states.shape[0], self.token_probs.shape[0]
+        if self.token_probs.shape[1] != self.num_experts or padded_rows < original_rows:
+            raise RuntimeError("HybridEP replay probabilities do not match the current dispatch")
+        if not self.config.moe_hybridep_pad_variable_tokens and padded_rows != original_rows:
+            raise RuntimeError("HybridEP replay has unequal rows with token equalization disabled")
+        routing = self.topk_idx if self.topk_idx is not None else self.routing_map
+        routing_width = self.router_topk if self.topk_idx is not None else self.num_experts
+        if routing is None or routing.shape != (padded_rows, routing_width):
+            raise RuntimeError("HybridEP replay routing does not match the current probabilities")
+        self._original_num_tokens = original_rows
+        self._padded_num_tokens = padded_rows
 
     def dispatch(
         self,
@@ -2098,6 +2138,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        if isinstance(self._comm_manager, _HybridEPManager):
+            self._comm_manager.restore_dispatch_token_counts(hidden_states)
         dispatched_hidden_states = self._comm_manager.dispatch(
             hidden_states, async_finish, allocate_on_comm_stream
         )

@@ -602,6 +602,26 @@ def reset_hybrid_ep_buffer():
     _hybrid_ep_buffer = None
 
 
+def _save_hybrid_ep_handle(ctx, handle):
+    """Expose routing tensors to saved-tensor hooks across dispatch and combine."""
+    tensor_indices = tuple(
+        index for index, value in enumerate(handle) if isinstance(value, torch.Tensor)
+    )
+    ctx.hybrid_ep_handle_tensor_indices = tensor_indices
+    ctx.hybrid_ep_handle_metadata = tuple(
+        None if index in tensor_indices else value for index, value in enumerate(handle)
+    )
+    ctx.save_for_backward(*(handle[index] for index in tensor_indices))
+
+
+def _restore_hybrid_ep_handle(ctx):
+    """Restore the native handle from autograd or graph-slot storage."""
+    handle = list(ctx.hybrid_ep_handle_metadata)
+    for index, tensor in zip(ctx.hybrid_ep_handle_tensor_indices, ctx.saved_tensors):
+        handle[index] = tensor
+    return tuple(handle)
+
+
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
@@ -695,7 +715,7 @@ class HybridEPDispatch(torch.autograd.Function):
             **dispatch_kwargs,
         )
 
-        ctx.handle = handle
+        _save_hybrid_ep_handle(ctx, handle)
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
         return (
@@ -711,7 +731,7 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         Backward pass of fused dispatch of the HybridEP backend
         '''
-        handle = ctx.handle
+        handle = _restore_hybrid_ep_handle(ctx)
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x,
             probs=grad_probs,
@@ -755,7 +775,7 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=pad_multiple,
             **({"fuse_unpermute_combine": fused} if fused else {}),
         )
-        ctx.handle = handle
+        _save_hybrid_ep_handle(ctx, handle)
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         ctx.fused = fused
@@ -766,7 +786,7 @@ class HybridEPCombine(torch.autograd.Function):
         '''
         Backward pass of fused combine of the HybridEP backend
         '''
-        handle = ctx.handle
+        handle = _restore_hybrid_ep_handle(ctx)
         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,

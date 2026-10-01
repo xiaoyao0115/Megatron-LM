@@ -889,6 +889,15 @@ class TEGroupedMLP(MegatronModule):
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 
+        if self._use_grouped_tensor:
+            # GEMMs leave unused capacity rows unwritten. Select probabilities before
+            # activation so their gradients are zero even when unused activations are NaN.
+            valid_rows = (
+                torch.arange(permuted_probs.size(0), device=permuted_probs.device).unsqueeze(-1)
+                < tokens_per_expert.sum()
+            )
+            permuted_probs = torch.where(valid_rows, permuted_probs, 0)
+
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

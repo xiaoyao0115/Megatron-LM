@@ -713,6 +713,7 @@ def topk_routing_with_score_function(
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    sort_topk: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -743,6 +744,10 @@ def topk_routing_with_score_function(
                                                 K3 Quantile Balancing histogram bounds.
         topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
                                                [num_tokens, topk]. Only used by the fused TE path.
+        sort_topk (bool | None, optional): Sort the unfused, ungrouped top-k scores before
+            normalization. None preserves the current grad-mode-dependent behavior. Training
+            callers should pass True so activation checkpointing preserves reduction order.
+            Fused, group-limited, and Quantile Balancing routing retain their own ordering.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -852,8 +857,9 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            # Checkpointed training must use the same order in forward and recompute.
+            sorted_topk = torch.is_grad_enabled() if sort_topk is None else sort_topk
+            return torch.topk(scores, k=topk, dim=1, sorted=sorted_topk)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active
