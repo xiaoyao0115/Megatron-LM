@@ -1522,6 +1522,7 @@ class TestChunkGraphRegression:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("mtp_layers", [1, 0])
     def test_thd_tp2_sp_mtp_capture_replay_matches_eager(self, monkeypatch, mtp_layers):
+        from megatron.core import full_cuda_graph
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
             init_num_microbatches_calculator,
@@ -1529,6 +1530,9 @@ class TestChunkGraphRegression:
         from megatron.core.tensor_parallel.random import initialize_rng_tracker
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
+        # Each parametrization owns a separate model. A preceding case may have
+        # released all graphs while tensors still keep its pool's blocks alive.
+        monkeypatch.setattr(full_cuda_graph, "_shared_graph_pool", None)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         # The capture sizes its TE warm-up from the run's micro-batch count.
@@ -2223,17 +2227,23 @@ class TestGraphDynamicRouteMetadataArena:
         # Keep this test topology-local. The route builder and owner attach still use the
         # production CP=2, rank-0 contract, but no process group or collective is required.
         monkeypatch.setattr(parallel_state, "get_context_parallel_rank", lambda: 0)
-        config = SimpleNamespace(
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=[],
             fine_grained_activation_offloading=False,
             delay_offload_until_cuda_graph=False,
-            dsa_cp_balance_indexer_graph_dynamic_packs=True,
             context_parallel_size=2,
             max_seqlen_per_dp_cp_rank=8,
             overlap_moe_expert_parallel_comm=False,
             delay_wgrad_compute=False,
         )
+        # The toy exercises route metadata ownership without constructing a DSA model.
+        config.dsa_cp_balance_indexer = True
+        config.sequence_packing_scheduler = "dp_balanced"
+        assert config.dsa_cp_balance_indexer_graph_dynamic_packs
 
         class LocalCPGroup:
             @staticmethod
@@ -2248,8 +2258,7 @@ class TestGraphDynamicRouteMetadataArena:
             def __init__(self, layer_number):
                 # A tiny test-only Graphable module avoids constructing a full TransformerLayer,
                 # while exercising GraphableMegatronModule's real TE replay/slot selection.
-                torch.nn.Module.__init__(self)
-                self.config = config
+                super().__init__(config)
                 self.pg_collection = SimpleNamespace(cp=LocalCPGroup())
                 self.layer_number = layer_number
                 self.gain = torch.nn.Parameter(
@@ -2260,8 +2269,6 @@ class TestGraphDynamicRouteMetadataArena:
                 self.bias = torch.nn.Parameter(
                     torch.linspace(-0.2, 0.1, 4, device="cuda") + 0.05 * layer_number
                 )
-                self.cuda_graphs = []
-                self.cuda_graph_manual_hooks = []
                 self._te_cuda_graph_route_replay_state = None
 
             @staticmethod
@@ -2276,7 +2283,9 @@ class TestGraphDynamicRouteMetadataArena:
                 # The production replay wrapper owns PackedSeqParams decomposition.
                 return TransformerLayer._te_cuda_graph_replay(self, *args, **kwargs)
 
-            def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+            def _te_cuda_graph_replay_impl(
+                self, args, kwargs, context, eager_packed_seq_params=None
+            ):
                 assert context is None
                 return GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
 
