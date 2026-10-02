@@ -13,27 +13,21 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.datasets.data_schedule import (
-    _validate_cuda_graph_microbatch_count,
-    get_batch_on_this_rank_for_sequence_packing,
-)
+from megatron.core.datasets.data_schedule import _validate_cuda_graph_microbatch_count
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.num_microbatches_calculator import (
-    destroy_num_microbatches_calculator,
-    init_num_microbatches_calculator,
-)
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import (
-    initialize_rng_tracker,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.dcp_graph_test_utils import (
+    assert_gradients_close,
+    dcp_batch,
+    dcp_test_context,
+    track_graph_replays,
+)
 
 
 def _pipeline_model(groups, recompute_lm_head=False):
@@ -97,44 +91,15 @@ def _pipeline_batches(model, groups, count):
             # Period three changes CP across a four-slot ring; period five changes the pack.
             size = (1, 2, 1)[index % 3]
             local_lengths = ((48,), (16, 32), (24, 24), (8, 40), (32, 16))[index % 5]
-            lengths = [length * size for length in local_lengths]
-            generator = torch.Generator(device="cpu").manual_seed(1000 + index)
-            tokens = torch.randint(0, 128, (sum(lengths) + 1,), generator=generator).cuda()
-            cu = torch.tensor([0, *lengths], dtype=torch.int32, device="cuda").cumsum(
-                0, dtype=torch.int32
-            )
-            raw = dict(
-                tokens=tokens[:-1].contiguous(),
-                labels=tokens[1:].contiguous(),
-                loss_mask=torch.ones(sum(lengths), dtype=torch.float32, device="cuda"),
-                position_ids=torch.cat([torch.arange(length) for length in lengths]).cuda(),
-                cu_seqlens=cu,
-                cu_seqlens_padded=cu.clone(),
-                max_seqlen=max(lengths),
-                local_cp_size=size,
-            )
-            values = get_batch_on_this_rank_for_sequence_packing(
-                iter([raw]),
-                dynamic_cp=True,
-                vpp_size=2,
-                vp_stage=chunk.vp_stage,
-                pg_collection=groups,
-                config=chunk.config,
-            )
             batches.append(
-                dict(
-                    zip(
-                        (
-                            "input_ids",
-                            "labels",
-                            "loss_mask",
-                            "attention_mask",
-                            "position_ids",
-                            "packed_seq_params",
-                            "padding_mask",
-                        ),
-                        values,
-                    )
+                dcp_batch(
+                    chunk.config,
+                    groups,
+                    size,
+                    local_lengths,
+                    1000 + index,
+                    vpp_size=2,
+                    vp_stage=chunk.vp_stage,
                 )
             )
         per_chunk.append(batches)
@@ -199,88 +164,64 @@ def test_chunk_dcp_pp2_vpp2_async_replay_matches_eager(monkeypatch, recompute_lm
     No optimizer update or DP reduction is needed: both executions use the same parameters
     and compare every rank's accumulated gradients after the production 1F1B schedule.
     """
-    Utils.destroy_model_parallel()
-    Utils.initialize_model_parallel(
+    with dcp_test_context(
+        monkeypatch,
+        num_microbatches=12,
         pipeline_model_parallel_size=2,
         virtual_pipeline_model_parallel_size=2,
-        context_parallel_size=1,
-        dynamic_context_parallel=True,
-    )
-    helper = None
-    try:
-        monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
-        monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
-        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
-        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        groups = ProcessGroupCollection.use_mpu_process_groups()
-        destroy_num_microbatches_calculator()
-        init_num_microbatches_calculator(
-            rank=torch.distributed.get_rank(),
-            global_batch_size=12 * groups.dp.size(),
-            micro_batch_size=1,
-            data_parallel_size=groups.dp.size(),
-        )
-        model = _pipeline_model(groups, recompute_lm_head)
-        batches = _pipeline_batches(model, groups, 12)
-        references = {
-            count: _run_schedule(model, groups, batches, count, defaultdict(list))
-            for count in (8, 12)
-        }
+    ) as groups:
+        helper = None
+        try:
+            model = _pipeline_model(groups, recompute_lm_head)
+            batches = _pipeline_batches(model, groups, 12)
+            references = {
+                count: _run_schedule(model, groups, batches, count, defaultdict(list))
+                for count in (8, 12)
+            }
 
-        helper = TECudaGraphHelper(
-            model,
-            model[0].config,
-            seq_length=64 * groups.dp_cp.size(),
-            micro_batch_size=1,
-            pg_collection=groups,
-            dynamic_cp_group_getter=parallel_state.get_dynamic_data_context_parallel_groups,
-        )
-        helper.create_cudagraphs()
-        assert helper.graphs_created()
-        assert helper.num_microbatches < 8, "the numerical test must actually wrap physical slots"
-        for chunk in model:
-            assert chunk.config._cuda_graph_num_microbatches >= 12
-            assert {8, 12} <= chunk.config._cuda_graph_allowed_microbatches
+            helper = TECudaGraphHelper(
+                model,
+                model[0].config,
+                seq_length=64 * groups.dp_cp.size(),
+                micro_batch_size=1,
+                pg_collection=groups,
+                dynamic_cp_group_getter=parallel_state.get_dynamic_data_context_parallel_groups,
+            )
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert (
+                helper.num_microbatches < 8
+            ), "the numerical test must actually wrap physical slots"
+            for chunk in model:
+                assert chunk.config._cuda_graph_num_microbatches >= 12
+                assert {8, 12} <= chunk.config._cuda_graph_allowed_microbatches
 
-        graph_launches = []
-        original_replay = torch.cuda.CUDAGraph.replay
-
-        def counting_replay(graph, *args, **kwargs):
-            graph_launches.append(graph)
-            return original_replay(graph, *args, **kwargs)
-
-        monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counting_replay)
-        for count in (8, 12, 8):
-            replay_slots = defaultdict(list)
-            before = len(graph_launches)
-            losses, gradients = _run_schedule(model, groups, batches, count, replay_slots)
-            callables = sum(1 + (chunk.postprocess_block is not None) for chunk in model)
-            assert len(graph_launches) - before >= 2 * count * callables
-            assert replay_slots
-            for vp_stage in range(2):
-                assert any(
-                    len(set(sizes)) == 2
-                    for (vp, _slot), sizes in replay_slots.items()
-                    if vp == vp_stage
-                ), "each chunk must reuse a physical slot with a different CP communicator"
-            if count == 12:
-                assert any(sizes == [1, 2, 1] for sizes in replay_slots.values())
-            expected_losses, expected_gradients = references[count]
-            assert len(losses) == len(expected_losses)
-            for actual, expected in zip(losses, expected_losses):
-                torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
-            assert gradients.keys() == expected_gradients.keys()
-            for name, expected in expected_gradients.items():
-                error = (gradients[name] - expected).norm()
-                assert error <= 2e-2 * expected.norm() + 1e-6, (name, count, error.item())
-        print(
-            f"CHUNK_DCP_PP_REPLAY_PASS pp=2 vpp=2 cp=1,2 "
-            f"slots={helper.num_microbatches} counts=8,12,8 overlap_p2p=True"
-        )
-    finally:
-        torch.cuda.synchronize()
-        if helper is not None:
-            helper.delete_cuda_graphs()
-        destroy_num_microbatches_calculator()
-        Utils.destroy_model_parallel()
+            graph_launches = track_graph_replays(monkeypatch)
+            for count in (8, 12, 8):
+                replay_slots = defaultdict(list)
+                before = len(graph_launches)
+                losses, gradients = _run_schedule(model, groups, batches, count, replay_slots)
+                callables = sum(1 + (chunk.postprocess_block is not None) for chunk in model)
+                assert len(graph_launches) - before >= 2 * count * callables
+                assert replay_slots
+                for vp_stage in range(2):
+                    assert any(
+                        len(set(sizes)) == 2
+                        for (vp, _slot), sizes in replay_slots.items()
+                        if vp == vp_stage
+                    ), "each chunk must reuse a physical slot with a different CP communicator"
+                if count == 12:
+                    assert any(sizes == [1, 2, 1] for sizes in replay_slots.values())
+                expected_losses, expected_gradients = references[count]
+                assert len(losses) == len(expected_losses)
+                for actual, expected in zip(losses, expected_losses):
+                    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+                assert_gradients_close(gradients, expected_gradients, count)
+            print(
+                f"CHUNK_DCP_PP_REPLAY_PASS pp=2 vpp=2 cp=1,2 "
+                f"slots={helper.num_microbatches} counts=8,12,8 overlap_p2p=True"
+            )
+        finally:
+            torch.cuda.synchronize()
+            if helper is not None:
+                helper.delete_cuda_graphs()

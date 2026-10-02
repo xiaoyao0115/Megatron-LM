@@ -58,37 +58,15 @@ def test_lm_head_cli_preserves_other_modules_and_normalizes_tp1(monkeypatch):
         "argv",
         [
             "test",
-            "--num-layers",
-            "1",
-            "--hidden-size",
-            "64",
-            "--num-attention-heads",
-            "4",
-            "--seq-length",
-            "16",
-            "--max-position-embeddings",
-            "16",
-            "--micro-batch-size",
-            "1",
-            "--global-batch-size",
-            os.environ.get("WORLD_SIZE", "1"),
-            "--train-iters",
-            "2",
-            "--lr",
-            "0.0001",
-            "--bf16",
-            "--mock-data",
-            "--tokenizer-type",
-            "NullTokenizer",
-            "--vocab-size",
-            "128",
-            "--untie-embeddings-and-output-weights",
-            "--sequence-parallel",
-            "--recompute-granularity",
-            "selective",
-            "--recompute-modules",
-            "layernorm",
-            "lm_head",
+            *f"""
+            --num-layers 1 --hidden-size 64 --num-attention-heads 4
+            --seq-length 16 --max-position-embeddings 16 --micro-batch-size 1
+            --global-batch-size {os.environ.get("WORLD_SIZE", "1")}
+            --train-iters 2 --lr 0.0001 --bf16 --mock-data
+            --tokenizer-type NullTokenizer --vocab-size 128
+            --untie-embeddings-and-output-weights --sequence-parallel
+            --recompute-granularity selective --recompute-modules layernorm lm_head
+        """.split(),
         ],
     )
     args = validate_args(parse_args())

@@ -47,9 +47,13 @@ def _input(offset=0):
 
 
 @pytest.mark.parametrize("use_hooks", [False, True], ids=["plain", "hooks"])
-@pytest.mark.parametrize("zero_dummy", [False, True], ids=["dummy", "zero_dummy"])
-def test_fused_linear_keeps_weight_owner(use_hooks, zero_dummy):
-    """Identity saved hooks must preserve fused wgrad and the original DDP flags."""
+@pytest.mark.parametrize(
+    "fused, zero_dummy",
+    [(True, False), (True, True), (False, False)],
+    ids=["fused-dummy", "fused-zero-dummy", "returned-wgrad"],
+)
+def test_linear_saved_hooks_preserve_gradients_and_weight_owner(use_hooks, fused, zero_dummy):
+    """Identity saved hooks preserve numerical gradients and the original DDP flags."""
     weight = _weight(zero_dummy)
     inp = _input()
     expected_input = inp.detach().clone().requires_grad_(True)
@@ -62,43 +66,22 @@ def test_fused_linear_keeps_weight_owner(use_hooks, zero_dummy):
         else contextlib.nullcontext()
     )
     with hooks:
-        actual = _linear(inp, weight)
+        actual = _linear(inp, weight, fused=fused)
     actual.sum().backward()
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(inp.grad, expected_input.grad)
-    # Fused wgrad accumulates in FP32; a BF16 leaf gradient has an extra rounding step.
-    expected_main_grad = inp.detach().float().sum(dim=(0, 1)).expand_as(weight)
-    torch.testing.assert_close(weight.main_grad, expected_main_grad + 0.25)
-    assert weight.grad_added_to_main_grad is True
-    assert weight.grad is not None, "DDP needs the dummy gradient to run AccumulateGrad"
-    if zero_dummy:
-        torch.testing.assert_close(weight.grad, torch.zeros_like(weight.grad))
-
-
-@pytest.mark.parametrize("use_hooks", [False, True], ids=["plain", "hooks"])
-def test_nonfused_linear_saved_hooks_match_torch(use_hooks):
-    """Normal returned parameter gradients keep their numerical behavior."""
-    weight = _weight(False)
-    inp = _input()
-    expected_input = inp.detach().clone().requires_grad_(True)
-    expected_weight = weight.detach().clone().requires_grad_(True)
-    expected = torch.nn.functional.linear(expected_input, expected_weight)
-    expected.sum().backward()
-    hooks = (
-        torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, lambda tensor: tensor)
-        if use_hooks
-        else contextlib.nullcontext()
-    )
-    with hooks:
-        actual = _linear(inp, weight, fused=False)
-    actual.sum().backward()
-
-    torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(inp.grad, expected_input.grad)
-    torch.testing.assert_close(weight.grad, expected_weight.grad)
-    torch.testing.assert_close(weight.main_grad, torch.full_like(weight.main_grad, 0.25))
-    assert weight.grad_added_to_main_grad is False
+    assert weight.grad_added_to_main_grad is fused
+    if fused:
+        # FP32 fused accumulation avoids the extra rounding in BF16 leaf gradients.
+        expected_main_grad = inp.detach().float().sum(dim=(0, 1)).expand_as(weight)
+        torch.testing.assert_close(weight.main_grad, expected_main_grad + 0.25)
+        assert weight.grad is not None, "DDP needs the dummy gradient to run AccumulateGrad"
+        if zero_dummy:
+            torch.testing.assert_close(weight.grad, torch.zeros_like(weight.grad))
+    else:
+        torch.testing.assert_close(weight.grad, expected_weight.grad)
+        torch.testing.assert_close(weight.main_grad, torch.full_like(weight.main_grad, 0.25))
 
 
 def test_fused_linear_reports_released_weight_owner():

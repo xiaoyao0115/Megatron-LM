@@ -15,28 +15,25 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.num_microbatches_calculator import (
-    destroy_num_microbatches_calculator,
-    init_num_microbatches_calculator,
-)
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import (
-    initialize_rng_tracker,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphPostProcessBlock
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, set_current_microbatch
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.dcp_graph_test_utils import (
+    assert_gradients_close,
+    dcp_batch,
+    dcp_test_context,
+)
+from tests.unit_tests.transformer.dcp_graph_test_utils import dcp_train_step as _train_step
+from tests.unit_tests.transformer.dcp_graph_test_utils import track_graph_replays
 
 pytestmark = pytest.mark.internal
 
@@ -268,64 +265,11 @@ def _build_dcp_model(groups, mtp_layers, granularity="chunk", max_cp_size=None):
 
 
 def _dcp_batch(config, groups, size, local_lengths, seed):
-    lengths = [length * size for length in local_lengths]
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    tokens = torch.randint(0, 128, (sum(lengths) + 1,), generator=generator).cuda()
-    cu = torch.tensor([0, *lengths], dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
-    raw = dict(
-        tokens=tokens[:-1].contiguous(),
-        labels=tokens[1:].contiguous(),
-        loss_mask=torch.ones(sum(lengths), dtype=torch.float32, device="cuda"),
-        position_ids=torch.cat([torch.arange(length) for length in lengths]).cuda(),
-        cu_seqlens=cu,
-        cu_seqlens_padded=cu.clone(),
-        max_seqlen=max(lengths),
-        local_cp_size=size,
-    )
-    result = get_batch_on_this_rank_for_sequence_packing(
-        iter([raw]),
-        dynamic_cp=True,
-        mtp_on_this_rank=bool(config.mtp_num_layers),
-        pg_collection=groups,
-        config=config,
-    )
-    batch = dict(
-        zip(
-            (
-                "input_ids",
-                "labels",
-                "loss_mask",
-                "attention_mask",
-                "position_ids",
-                "packed_seq_params",
-                "padding_mask",
-            ),
-            result,
-        )
-    )
+    batch = dcp_batch(config, groups, size, local_lengths, seed)
     assert batch["input_ids"].shape == (1, 64)
     assert batch["packed_seq_params"].cu_seqlens_q.numel() == 5
     assert batch["packed_seq_params"].local_cp_size == size
     return batch
-
-
-def _train_step(model, batch, microbatch):
-    set_current_microbatch(model, microbatch)
-    for parameter in model.parameters():
-        # Do not let AccumulateGrad adopt TE's recyclable static dgrad allocation.
-        if parameter.grad is None:
-            parameter.grad = torch.zeros_like(parameter)
-        else:
-            parameter.grad.zero_()
-    loss = model(**batch)
-    values = loss.detach().float().clone()
-    ((loss.float() * batch["loss_mask"]).sum() / batch["loss_mask"].sum()).backward()
-    gradients = {
-        name: parameter.grad.detach().float().clone()
-        for name, parameter in model.named_parameters()
-        if parameter.grad is not None
-    }
-    return values, gradients
 
 
 @_REQUIRES_TWO_RANKS
@@ -343,93 +287,63 @@ def test_dynamic_cp_max_capture_replay_matches_eager(granularity, monkeypatch):
 
 
 def _check_dcp_capture_replay(mtp_layers, monkeypatch, granularity="chunk", max_cp_size=None):
-    Utils.destroy_model_parallel()
-    Utils.initialize_model_parallel(
-        context_parallel_size=1,
-        dynamic_context_parallel=True,
-        max_dynamic_context_parallel_size=max_cp_size,
-    )
-    helper = None
-    try:
-        monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
-        monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
-        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
-        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        groups = ProcessGroupCollection.use_mpu_process_groups()
-        getter = parallel_state.get_dynamic_data_context_parallel_groups
-        destroy_num_microbatches_calculator()
-        init_num_microbatches_calculator(
-            rank=torch.distributed.get_rank(),
-            global_batch_size=groups.dp.size(),
-            micro_batch_size=1,
-            data_parallel_size=groups.dp.size(),
-        )
-        model = _build_dcp_model(groups, mtp_layers, granularity, max_cp_size)
-        maximum = groups.dp_cp.size() if max_cp_size is None else max_cp_size
-        sizes = tuple(2**exponent for exponent in range(maximum.bit_length()))
-        if max_cp_size is not None:
-            assert groups.dp_cp.size() == 4
-            assert set(parallel_state._DYNAMIC_DP_CP_GROUPS) == set(sizes)
-            for size in sizes:
-                group = getter(group_size=size)
-                ranks = torch.distributed.get_process_group_ranks(group)
-                assert group.size() == size and ranks[0] % size == 0
-                assert ranks == list(range(ranks[0], ranks[0] + size))
-        cases = [(size, lengths) for size in sizes for lengths in ((48,), (16, 32))]
-        batches = [
-            _dcp_batch(model.config, groups, size, lengths, index)
-            for index, (size, lengths) in enumerate(cases)
-        ]
-        reference = [_train_step(model, batch, index) for index, batch in enumerate(batches)]
+    with dcp_test_context(monkeypatch, max_dynamic_context_parallel_size=max_cp_size) as groups:
+        helper = None
+        try:
+            getter = parallel_state.get_dynamic_data_context_parallel_groups
+            model = _build_dcp_model(groups, mtp_layers, granularity, max_cp_size)
+            maximum = groups.dp_cp.size() if max_cp_size is None else max_cp_size
+            sizes = tuple(2**exponent for exponent in range(maximum.bit_length()))
+            if max_cp_size is not None:
+                assert groups.dp_cp.size() == 4
+                assert set(parallel_state._DYNAMIC_DP_CP_GROUPS) == set(sizes)
+                for size in sizes:
+                    group = getter(group_size=size)
+                    ranks = torch.distributed.get_process_group_ranks(group)
+                    assert group.size() == size and ranks[0] % size == 0
+                    assert ranks == list(range(ranks[0], ranks[0] + size))
+            cases = [(size, lengths) for size in sizes for lengths in ((48,), (16, 32))]
+            batches = [
+                _dcp_batch(model.config, groups, size, lengths, index)
+                for index, (size, lengths) in enumerate(cases)
+            ]
+            reference = [_train_step(model, batch, index) for index, batch in enumerate(batches)]
 
-        helper = TECudaGraphHelper(
-            [model],
-            model.config,
-            seq_length=64 * groups.dp_cp.size(),
-            micro_batch_size=1,
-            pg_collection=groups,
-            dynamic_cp_group_getter=getter,
-        )
-        if granularity == "chunk":
-            assert helper.flattened_callables == [model.decoder, model.postprocess_block]
-        else:
-            assert helper.flattened_callables == list(model.decoder.layers)
-        assert helper._get_dynamic_cp_capture_sizes() == tuple(reversed(sizes))
-        helper.create_cudagraphs()
-        assert helper.graphs_created()
-        for block in helper.flattened_callables:
-            assert set(block.cuda_graphs_by_dynamic_cp_size) == set(sizes)
-            assert all(len(bank) == 1 for bank in block.cuda_graphs_by_dynamic_cp_size.values())
+            helper = TECudaGraphHelper(
+                [model],
+                model.config,
+                seq_length=64 * groups.dp_cp.size(),
+                micro_batch_size=1,
+                pg_collection=groups,
+                dynamic_cp_group_getter=getter,
+            )
+            if granularity == "chunk":
+                assert helper.flattened_callables == [model.decoder, model.postprocess_block]
+            else:
+                assert helper.flattened_callables == list(model.decoder.layers)
+            assert helper._get_dynamic_cp_capture_sizes() == tuple(reversed(sizes))
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            for block in helper.flattened_callables:
+                assert set(block.cuda_graphs_by_dynamic_cp_size) == set(sizes)
+                assert all(len(bank) == 1 for bank in block.cuda_graphs_by_dynamic_cp_size.values())
 
-        replays = []
-        original_replay = torch.cuda.CUDAGraph.replay
-
-        def counting_replay(graph, *args, **kwargs):
-            replays.append(graph)
-            return original_replay(graph, *args, **kwargs)
-
-        monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counting_replay)
-        # Return to earlier banks and packs after intervening captures/replays overwrite buffers.
-        order = (*range(len(batches)), *reversed(range(len(batches))), 0)
-        for microbatch, index in enumerate(order):
-            before = len(replays)
-            values, gradients = _train_step(model, batches[index], microbatch)
-            assert (
-                len(replays) - before >= 4
-            ), "both captured modules must replay forward and backward"
-            expected_values, expected_gradients = reference[index]
-            torch.testing.assert_close(values, expected_values, rtol=1e-3, atol=1e-3)
-            assert gradients.keys() == expected_gradients.keys()
-            for name, expected in expected_gradients.items():
-                error = (gradients[name] - expected).norm()
-                assert error <= 2e-2 * expected.norm() + 1e-6, (name, index, error.item())
-        print(
-            f"DCP_REPLAY_PASS granularity={granularity} mtp={mtp_layers} cp_sizes={sizes} microbatches={len(order)}"
-        )
-    finally:
-        torch.cuda.synchronize()
-        if helper is not None:
-            helper.delete_cuda_graphs()
-        destroy_num_microbatches_calculator()
-        Utils.destroy_model_parallel()
+            replays = track_graph_replays(monkeypatch)
+            # Return to earlier banks and packs after intervening captures/replays overwrite buffers.
+            order = (*range(len(batches)), *reversed(range(len(batches))), 0)
+            for microbatch, index in enumerate(order):
+                before = len(replays)
+                values, gradients = _train_step(model, batches[index], microbatch)
+                assert (
+                    len(replays) - before >= 4
+                ), "both captured modules must replay forward and backward"
+                expected_values, expected_gradients = reference[index]
+                torch.testing.assert_close(values, expected_values, rtol=1e-3, atol=1e-3)
+                assert_gradients_close(gradients, expected_gradients, index)
+            print(
+                f"DCP_REPLAY_PASS granularity={granularity} mtp={mtp_layers} cp_sizes={sizes} microbatches={len(order)}"
+            )
+        finally:
+            torch.cuda.synchronize()
+            if helper is not None:
+                helper.delete_cuda_graphs()
