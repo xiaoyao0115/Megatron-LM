@@ -222,7 +222,13 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        if cp_size_chunkwise > 1:
+        if getattr(packed_seq_params, 'gdn_graph_safe', False):
+            from fla.ops.cp.graph import build_graph_cp_context
+
+            chunkwise_cp_context = build_graph_cp_context(
+                cu_seqlens_q, cp_group_chunkwise, seq_len_post_headwise, self.conv_kernel_dim
+            )
+        elif cp_size_chunkwise > 1:
             if build_cp_context is None:
                 raise ImportError(
                     "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "

@@ -1425,6 +1425,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
+        if self.config.experimental_attention_variant == "gdn" and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        ):
+            from megatron.core.context_parallel_layout.graph import validate_packed_gdn_graph_inputs
+
+            validate_packed_gdn_graph_inputs(self.config, packed_seq_params)
         kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
@@ -1486,6 +1493,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
         )
+        if self.config.experimental_attention_variant == "gdn" and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        ):
+            from megatron.core.context_parallel_layout.graph import supports_packed_gdn_graph
+
+            if not supports_packed_gdn_graph(self.config):
+                raise ValueError("Unsupported packed GDN attention CUDA graph configuration")
+            packed_seq_params.gdn_graph_safe = True
         if graph_dynamic_plan is not None:
             cp_balanced_indexer.attach_graph_dynamic_plan(packed_seq_params, graph_dynamic_plan)
         elif self._uses_graph_dynamic_dsa_route():

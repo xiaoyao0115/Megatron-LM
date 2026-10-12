@@ -2587,11 +2587,8 @@ class TECudaGraphHelper:
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
-                # The TE sample builder currently materializes only the regular RoPE
-                # contract. Yarn and mRoPE need different runtime inputs, while packed
-                # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
-                # sample behavior unchanged here and warn below when one of those
-                # unsupported contracts is actually captured.
+                # Packed THD applies CP partitioning when RoPE is used, so the sample
+                # must retain the full table. Yarn and mRoPE need different inputs.
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
@@ -2607,9 +2604,16 @@ class TECudaGraphHelper:
                         )
                     cache_key = (rotary_seq_len, packed_seq, capture_cp_group)
                     if cache_key not in rotary_pos_emb_cache:
-                        rotary_pos_emb_cache[cache_key] = transformer_module.rotary_pos_emb(
+                        rotary_table = transformer_module.rotary_pos_emb(
                             rotary_seq_len, packed_seq=packed_seq, cp_group=capture_cp_group
                         )
+                        if packed_seq and rotary_table.shape[0] != rotary_seq_len:
+                            raise RuntimeError(
+                                "Packed THD CUDA graph capture requires the full RoPE table: "
+                                f"expected {rotary_seq_len} positions, "
+                                f"got {rotary_table.shape[0]}."
+                            )
+                        rotary_pos_emb_cache[cache_key] = rotary_table
                     return rotary_pos_emb_cache[cache_key]
                 else:
                     return None
@@ -2666,12 +2670,6 @@ class TECudaGraphHelper:
                     unsupported_reasons.append(
                         'mRoPE rotary embeddings are not represented in the capture sample inputs'
                     )
-                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
-                    unsupported_reasons.append(
-                        'THD with context parallelism captures a CP-sliced RoPE table, while '
-                        'runtime packed sequences use the full table'
-                    )
-
                 warning_key = (position_embedding_type, is_thd, context_parallel_size)
                 if unsupported_reasons and warning_key not in warned_rotary_sample_contracts:
                     warned_rotary_sample_contracts.add(warning_key)

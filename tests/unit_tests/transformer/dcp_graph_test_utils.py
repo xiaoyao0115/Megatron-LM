@@ -104,7 +104,14 @@ def dcp_train_step(model, batch, microbatch, *, cpu=False):
 
     loss = model(**batch)
     values = snapshot(loss)
-    ((loss.float() * batch["loss_mask"]).sum() / batch["loss_mask"].sum()).backward()
+    # A contiguous CP shard may be entirely padding. Normalize by the CP-wide
+    # token count, so a valid global pack never produces a local 0/0 loss.
+    num_tokens = batch["loss_mask"].sum()
+    cp_group = batch["packed_seq_params"].cp_group
+    if cp_group is not None and cp_group.size() > 1:
+        torch.distributed.all_reduce(num_tokens, group=cp_group)
+    assert num_tokens > 0, "the full CP pack must contain valid tokens"
+    ((loss.float() * batch["loss_mask"]).sum() / num_tokens).backward()
     gradients = {
         name: snapshot(parameter.grad)
         for name, parameter in model.named_parameters()
