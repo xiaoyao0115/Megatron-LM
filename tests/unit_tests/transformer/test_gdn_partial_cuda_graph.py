@@ -258,6 +258,19 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch):
                 == 3
             )
             capture_bank = helper._capture_graph_bank
+            import transformer_engine.pytorch.graph as te_graph
+
+            copy_span = te_graph._copy_tensor_storage_span
+            compact_alpha_copies = []
+
+            def checked_copy_span(target, source, size_bytes):
+                if source.dtype == torch.bfloat16 and source.shape == (1, 512, 4):
+                    assert source.is_contiguous()
+                    assert size_bytes == source.numel() * source.element_size()
+                    compact_alpha_copies.append(size_bytes)
+                return copy_span(target, source, size_bytes)
+
+            monkeypatch.setattr(te_graph, "_copy_tensor_storage_span", checked_copy_span)
 
             def checked_capture_bank(callables, sample_args, kwargs):
                 assert len(callables) == len(kwargs["sample_kwargs"]) == 15
@@ -268,6 +281,7 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch):
 
             monkeypatch.setattr(helper, "_capture_graph_bank", checked_capture_bank)
             helper.create_cudagraphs()
+            assert compact_alpha_copies, "captured GDN alpha snapshots must use compact storage"
             print(f"GDN_PARTIAL_CAPTURE_COMPLETE rank={torch.distributed.get_rank()}", flush=True)
             assert helper.graphs_created()
             for layer in helper.flattened_callables:

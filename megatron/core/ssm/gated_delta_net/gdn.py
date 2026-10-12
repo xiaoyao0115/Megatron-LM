@@ -487,6 +487,9 @@ class GatedDeltaNet(_GDNBase):
         qkv, gate, beta, alpha = torch.split(
             qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
         )
+        if getattr(packed_seq_params, 'gdn_graph_safe', False):
+            # AOT saves alpha for backward; its projection stride would snapshot the full row span.
+            alpha = alpha.contiguous()
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         nvtx_range_push(suffix="conv1d")
