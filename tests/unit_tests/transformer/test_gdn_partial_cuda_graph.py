@@ -193,7 +193,9 @@ def test_moe_only_scope_does_not_require_gdn_graph_geometry():
 
 
 @pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", "1")) != 4, reason="requires four ranks")
-def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch):
+@pytest.mark.parametrize("capture_mode", ["slots", "native", "native_shared_pool"])
+def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode):
+    shared_slots = capture_mode == "slots"
     with dcp_test_context(monkeypatch, expert_model_parallel_size=4) as groups:
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
         config = _config(expert_model_parallel_size=4, mtp_num_layers=1)
@@ -241,6 +243,18 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch):
                     f"case={index} local_valid_tokens={batch['loss_mask'].sum().item()}",
                     flush=True,
                 )
+            for index, batch in enumerate(batches):
+                params = batch["packed_seq_params"]
+                original_max = params.max_seqlen_q, params.max_seqlen_kv
+                params.gdn_graph_safe = True
+                params.max_seqlen_q = params.max_seqlen_kv = 512 * params.local_cp_size
+                try:
+                    values, gradients = dcp_train_step(model, batch, index, cpu=True)
+                    torch.testing.assert_close(values, references[index][0], rtol=1e-3, atol=1e-3)
+                    assert_gradients_close(gradients, references[index][1], index)
+                finally:
+                    del params.gdn_graph_safe
+                    params.max_seqlen_q, params.max_seqlen_kv = original_max
             helper = TECudaGraphHelper(
                 [model],
                 config,
@@ -258,6 +272,11 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch):
                 == 3
             )
             capture_bank = helper._capture_graph_bank
+            if not shared_slots:
+                monkeypatch.setattr(helper, "_should_share_dynamic_cp_pool", lambda: False)
+            native_pool = (
+                torch.cuda.graph_pool_handle() if capture_mode == "native_shared_pool" else None
+            )
             import transformer_engine.pytorch.graph as te_graph
 
             copy_span = te_graph._copy_tensor_storage_span
@@ -273,15 +292,25 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch):
             monkeypatch.setattr(te_graph, "_copy_tensor_storage_span", checked_copy_span)
 
             def checked_capture_bank(callables, sample_args, kwargs):
-                assert len(callables) == len(kwargs["sample_kwargs"]) == 15
+                assert len(callables) == len(kwargs["sample_kwargs"]) == (15 if shared_slots else 5)
                 for callable_, inputs in zip(callables, kwargs["sample_kwargs"]):
-                    cp_size = callable_._capture_context[0]
+                    cp_size = (
+                        callable_._capture_context[0]
+                        if shared_slots
+                        else config._cuda_graph_capture_dynamic_cp[0]
+                    )
                     assert inputs["rotary_pos_emb"].shape[0] == 512 * cp_size
+                if native_pool is not None:
+                    assert helper.pp_group.size() == helper.num_microbatches == 1
+                    kwargs = dict(kwargs, pool=native_pool)
                 return capture_bank(callables, sample_args, kwargs)
 
             monkeypatch.setattr(helper, "_capture_graph_bank", checked_capture_bank)
             helper.create_cudagraphs()
-            assert compact_alpha_copies, "captured GDN alpha snapshots must use compact storage"
+            if shared_slots:
+                assert compact_alpha_copies, "captured GDN alpha snapshots must use compact storage"
+            else:
+                assert not compact_alpha_copies, "native banks must not use slot saved-span copies"
             print(f"GDN_PARTIAL_CAPTURE_COMPLETE rank={torch.distributed.get_rank()}", flush=True)
             assert helper.graphs_created()
             for layer in helper.flattened_callables:
