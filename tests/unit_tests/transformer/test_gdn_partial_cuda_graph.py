@@ -9,7 +9,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout.graph import (
-    pad_graph_headwise_sequences,
+    cache_packed_gdn_graph_validation,
     supports_packed_gdn_graph,
     validate_packed_gdn_graph_inputs,
 )
@@ -134,23 +134,26 @@ def test_headwise_graph_accepts_non_chunk_aligned_sequences(size):
     validate_packed_gdn_graph_inputs(config, params)
 
 
-@pytest.mark.parametrize("boundaries", [[0, 130, 384, 512, 512], [0, 2, 6, 510, 512]])
-def test_headwise_graph_padding_preserves_original_tokens_and_gradients(boundaries):
-    cu = torch.tensor(boundaries, dtype=torch.int32)
-    value = torch.randn(512, 1, 8, requires_grad=True)
-    padded, aligned_cu, indices = pad_graph_headwise_sequences(value, cu)
-    assert padded.shape == (704, 1, 8)
-    assert torch.all(aligned_cu.diff() % 64 == 0)
-    assert aligned_cu[-1] == padded.shape[0]
-    original_pos = torch.arange(value.shape[0])
-    original_seq = torch.searchsorted(cu[1:], original_pos, right=True)
-    padded_seq = torch.searchsorted(aligned_cu[1:], indices, right=True)
-    torch.testing.assert_close(original_seq, padded_seq)
-    torch.testing.assert_close(indices - aligned_cu[padded_seq], original_pos - cu[original_seq])
-    restored = padded.index_select(0, indices)
-    torch.testing.assert_close(restored, value)
-    restored.square().sum().backward()
-    torch.testing.assert_close(value.grad, 2 * value.detach())
+@pytest.mark.parametrize(
+    "boundaries", [[0, 130, 384, 512, 512], [0, 2, 6, 510, 512], [0, 2, 4, 6, 8, 10, 12, 14, 512]]
+)
+def test_headwise_graph_context_preserves_unaligned_sequence_boundaries(boundaries):
+    from fla.ops.cp.graph import build_graph_cp_context
+
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    cu = torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+    ctx = build_graph_cp_context(cu, None, 512, allow_unaligned_sequences=True)
+    torch.testing.assert_close(ctx.cu_seqlens, cu)
+    counts = [(end - start + 63) // 64 for start, end in zip(boundaries, boundaries[1:])]
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    assert ctx.chunk_offsets.tolist() == offsets
+    expected = [[seq, chunk] for seq, count in enumerate(counts) for chunk in range(count)]
+    capacity = 512 // 64 + len(boundaries) - 2
+    last = len(counts) - 1
+    expected.extend([last, counts[last] + extra] for extra in range(capacity - len(expected)))
+    assert ctx.chunk_indices.tolist() == expected
 
 
 @pytest.mark.parametrize(
@@ -223,6 +226,56 @@ def test_partial_gdn_revalidates_mutated_packs():
         validate_packed_gdn_graph_inputs(config, params)
 
 
+@pytest.mark.parametrize("raw_storage_mutation", [False, True])
+def test_validation_cache_is_forward_scoped_and_rechecks_mutations(
+    monkeypatch, raw_storage_mutation
+):
+    config = _config()
+    params = _params(config, 1)
+    cpu_reads = []
+    original_cpu = torch.Tensor.cpu
+
+    def tracked_cpu(tensor, *args, **kwargs):
+        cpu_reads.append(1)
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", tracked_cpu)
+
+    class Model:
+        @cache_packed_gdn_graph_validation
+        def forward(self, mutate=False):
+            validate_packed_gdn_graph_inputs(self.config, params)
+            validate_packed_gdn_graph_inputs(self.config, params)
+            if mutate:
+                for name in _CU_NAMES:
+                    getattr(params, name)[1] += 1
+                validate_packed_gdn_graph_inputs(self.config, params)
+
+    model = Model()
+    model.config = config
+    model.forward()
+    assert len(cpu_reads) == 1
+    validate_packed_gdn_graph_inputs(config, params)
+    assert len(cpu_reads) == 2, "standalone replay must remain uncached"
+    if raw_storage_mutation:
+        # Simulate a producer update without a Tensor version bump between forwards.
+        for name in _CU_NAMES:
+            getattr(params, name).data[1] += 1
+        with pytest.raises(ValueError, match="64/2CP-aligned"):
+            model.forward()
+        assert len(cpu_reads) == 3
+    else:
+        with pytest.raises(ValueError, match="64/2CP-aligned"):
+            model.forward(mutate=True)
+        assert len(cpu_reads) == 4
+    for name in _CU_NAMES:
+        getattr(params, name)[1] = 128
+    validate_packed_gdn_graph_inputs(config, params)
+    assert len(cpu_reads) == (
+        4 if raw_storage_mutation else 5
+    ), "failed forwards must clear the cache"
+
+
 def test_moe_only_scope_does_not_require_gdn_graph_geometry():
     config = _config(
         cuda_graph_modules=["moe_router"], tensor_model_parallel_size=2, sequence_parallel=True
@@ -286,7 +339,7 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode,
         helper = None
         try:
             layouts = (
-                ((384,), (128, 256), (130, 254))
+                ((384,), (128, 256), (130, 254), (2, 2, 2, 2, 2, 2, 372))
                 if linear_cp_mode == "headwise"
                 else ((384,), (128, 256))
             )
@@ -347,11 +400,7 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode,
             compact_alpha_copies = []
             alpha_shapes = {
                 (
-                    (
-                        1,
-                        512 * size + 64 * (config.thd_max_packed_sequences - 1),
-                        config.linear_num_value_heads // size,
-                    )
+                    (1, 512 * size, config.linear_num_value_heads // size)
                     if linear_cp_mode == "headwise"
                     else (1, 512, config.linear_num_value_heads)
                 )

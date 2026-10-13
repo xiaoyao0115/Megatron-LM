@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from functools import wraps
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,6 +13,24 @@ import torch
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.transformer_config import TransformerConfig
+
+_GDN_VALIDATION_CACHE = ContextVar("packed_gdn_validation_cache", default=None)
+
+
+def cache_packed_gdn_graph_validation(forward):
+    """Deduplicate checks within one GPT forward; standalone layers stay uncached."""
+
+    @wraps(forward)
+    def scoped(model, *args, **kwargs):
+        if not supports_packed_gdn_graph(model.config):
+            return forward(model, *args, **kwargs)
+        token = _GDN_VALIDATION_CACHE.set({})
+        try:
+            return forward(model, *args, **kwargs)
+        finally:
+            _GDN_VALIDATION_CACHE.reset(token)
+
+    return scoped
 
 
 def supports_packed_gdn_graph(config: TransformerConfig) -> bool:
@@ -40,7 +60,7 @@ def validate_packed_gdn_graph_inputs(
     """Check each pack before replay, outside capture where host reads are legal.
 
     Chunkwise FLA graphs need 64-aligned physical sequences. Headwise graphs
-    align them internally after the head exchange, preserving the input pack.
+    use fixed-capacity chunk indices without changing physical sequence lengths.
     Actual q/kv lengths may exclude padding,
     but self-attention requires matching query/key boundaries in both layouts.
     """
@@ -67,6 +87,21 @@ def validate_packed_gdn_graph_inputs(
         for value in arrays
     ):
         raise ValueError("GDN graphs require fixed-capacity int32 q/kv packed metadata")
+    cache = _GDN_VALIDATION_CACHE.get()
+    cache_key = None
+    if cache is not None:
+        try:
+            cache_key = (
+                id(packed_seq_params),
+                cp_size,
+                capacity,
+                config.linear_cp_mode,
+                tuple((id(value), value._version) for value in arrays),
+            )
+        except RuntimeError:
+            pass  # Inference tensors lack version counters and are checked every time.
+        if cache_key is not None and cache.get(cache_key) is packed_seq_params:
+            return
     actual_q, actual_kv, padded_q, padded_kv = torch.stack(arrays).cpu().tolist()
     if actual_q != actual_kv or padded_q != padded_kv:
         raise ValueError("GDN graphs require identical query and key sequence boundaries")
@@ -84,31 +119,8 @@ def validate_packed_gdn_graph_inputs(
         for start, end in zip(padded_q, padded_q[1:])
     ):
         raise ValueError("GDN graph physical sequence lengths must be 64/2CP-aligned")
-
-
-def pad_graph_headwise_sequences(value: torch.Tensor, cu_seqlens: torch.Tensor):
-    """Align complete head-local sequences without changing the public THD pack.
-
-    At most N-1 extra chunks cover rounding N sequences whose total is aligned.
-    Extend the last physical sequence to this fixed bound; its extra outputs are
-    discarded and its added decay/update gates must be zeroed by the caller.
-    """
-    lengths = cu_seqlens.diff()
-    capacity = value.shape[0] + 64 * (cu_seqlens.numel() - 2)
-    aligned_lengths = ((lengths + 63) // 64) * 64
-    aligned_cu = torch.cat(
-        (cu_seqlens.new_zeros(1), aligned_lengths.cumsum(0, dtype=cu_seqlens.dtype))
-    )
-    aligned_cu = torch.where(
-        torch.arange(cu_seqlens.numel(), device=value.device) >= (lengths > 0).sum(),
-        capacity,
-        aligned_cu,
-    )
-    positions = torch.arange(value.shape[0], device=value.device)
-    seq = torch.searchsorted(cu_seqlens[1:], positions, right=True)
-    indices = aligned_cu[seq].long() + positions - cu_seqlens[seq].long()
-    padded = value.new_zeros((capacity, *value.shape[1:]))
-    return padded.index_copy(0, indices, value), aligned_cu, indices
+    if cache_key is not None:
+        cache[cache_key] = packed_seq_params
 
 
 def _packed_layout_indices(cu_seqlens, local_tokens, cp_size, cp_rank):
