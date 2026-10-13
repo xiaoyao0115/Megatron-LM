@@ -222,7 +222,10 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        if getattr(packed_seq_params, 'gdn_graph_safe', False):
+        if (
+            getattr(packed_seq_params, 'gdn_graph_safe', False)
+            and self.config.linear_cp_mode == "chunkwise"
+        ):
             from fla.ops.cp.graph import build_graph_cp_context
 
             chunkwise_cp_context = build_graph_cp_context(
@@ -332,6 +335,23 @@ class GatedDeltaNet(_GDNBase):
             seq_len_post_headwise,
             packed_seq_params,
         )
+        headwise_graph_indices = None
+        gdn_seq_len = seq_len_post_headwise
+        if (
+            getattr(packed_seq_params, 'gdn_graph_safe', False)
+            and self.config.linear_cp_mode == "headwise"
+        ):
+            from fla.ops.cp.graph import build_graph_cp_context
+
+            from megatron.core.context_parallel_layout.graph import pad_graph_headwise_sequences
+
+            qkvzba, aligned_cu, headwise_graph_indices = pad_graph_headwise_sequences(
+                qkvzba, cu_seqlens_q
+            )
+            gdn_seq_len = qkvzba.shape[0]
+            chunkwise_cp_context = build_graph_cp_context(
+                aligned_cu, None, gdn_seq_len, self.conv_kernel_dim
+            )
 
         if self.gdn_pre_gated_delta_rule_fusion:
             if cp_size_chunkwise > 1 and batch > 1:
@@ -384,7 +404,7 @@ class GatedDeltaNet(_GDNBase):
             query, key, value, gate, beta, g = self.pre_gated_delta_rule(
                 qkvzba,
                 batch,
-                seq_len_post_headwise,
+                gdn_seq_len,
                 cp_size_headwise,
                 cp_group_headwise,
                 cu_seqlens_q,
@@ -393,6 +413,12 @@ class GatedDeltaNet(_GDNBase):
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        if headwise_graph_indices is not None:
+            keep = torch.zeros(gdn_seq_len, dtype=torch.bool, device=qkvzba.device)
+            keep.index_fill_(0, headwise_graph_indices, True)
+            for name in ("g", "beta"):
+                kernel_inputs[name] = kernel_inputs[name].masked_fill(~keep[None, :, None], 0)
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -404,6 +430,9 @@ class GatedDeltaNet(_GDNBase):
             cp_context=chunkwise_cp_context,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        if headwise_graph_indices is not None:
+            core_attn_out = core_attn_out.index_select(1, headwise_graph_indices)
+            gate = gate.index_select(1, headwise_graph_indices)
 
         if self.recompute_norm_out and self.training:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()

@@ -20,8 +20,8 @@ def supports_packed_gdn_graph(config: TransformerConfig) -> bool:
         config.experimental_attention_variant == "gdn"
         and config.cuda_graph_impl == "transformer_engine"
         and config.sequence_packing_scheduler is not None
-        and config.linear_cp_mode == "chunkwise"
-        and config.cp_partition_mode == "contiguous"
+        and (config.linear_cp_mode, config.cp_partition_mode)
+        in (("chunkwise", "contiguous"), ("headwise", "zigzag"))
         and config.tensor_model_parallel_size == 1
         and not config.gdn_pre_gated_delta_rule_fusion
         and not config.overlap_moe_expert_parallel_comm
@@ -39,13 +39,19 @@ def validate_packed_gdn_graph_inputs(
 ) -> None:
     """Check each pack before replay, outside capture where host reads are legal.
 
-    The FLA graph kernels assume nonempty 64-aligned physical sequences followed
-    only by repeated capacity entries. Actual q/kv lengths may exclude padding,
+    Chunkwise FLA graphs need 64-aligned physical sequences. Headwise graphs
+    align them internally after the head exchange, preserving the input pack.
+    Actual q/kv lengths may exclude padding,
     but self-attention requires matching query/key boundaries in both layouts.
     """
     if not supports_packed_gdn_graph(config):
         raise ValueError("Unsupported packed GDN graph configuration")
     cp_size = packed_seq_params.local_cp_size or config.context_parallel_size
+    if config.linear_cp_mode == "headwise" and any(
+        heads % (config.tensor_model_parallel_size * cp_size)
+        for heads in (config.linear_num_key_heads, config.linear_num_value_heads)
+    ):
+        raise ValueError("GDN headwise graphs require CP to evenly divide the TP-local heads")
     capacity = config.max_seqlen_per_dp_cp_rank * cp_size
     arrays = (
         packed_seq_params.cu_seqlens_q,
@@ -73,10 +79,36 @@ def validate_packed_gdn_graph_inputs(
         if not 0 <= valid_length <= end - start:
             raise ValueError("GDN graph valid lengths must fit their physical sequence lengths")
     if any(
-        (end - start) % 64 or (end - start) % (2 * cp_size)
+        (config.linear_cp_mode == "chunkwise" and (end - start) % 64)
+        or (end - start) % (2 * cp_size)
         for start, end in zip(padded_q, padded_q[1:])
     ):
         raise ValueError("GDN graph physical sequence lengths must be 64/2CP-aligned")
+
+
+def pad_graph_headwise_sequences(value: torch.Tensor, cu_seqlens: torch.Tensor):
+    """Align complete head-local sequences without changing the public THD pack.
+
+    At most N-1 extra chunks cover rounding N sequences whose total is aligned.
+    Extend the last physical sequence to this fixed bound; its extra outputs are
+    discarded and its added decay/update gates must be zeroed by the caller.
+    """
+    lengths = cu_seqlens.diff()
+    capacity = value.shape[0] + 64 * (cu_seqlens.numel() - 2)
+    aligned_lengths = ((lengths + 63) // 64) * 64
+    aligned_cu = torch.cat(
+        (cu_seqlens.new_zeros(1), aligned_lengths.cumsum(0, dtype=cu_seqlens.dtype))
+    )
+    aligned_cu = torch.where(
+        torch.arange(cu_seqlens.numel(), device=value.device) >= (lengths > 0).sum(),
+        capacity,
+        aligned_cu,
+    )
+    positions = torch.arange(value.shape[0], device=value.device)
+    seq = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+    indices = aligned_cu[seq].long() + positions - cu_seqlens[seq].long()
+    padded = value.new_zeros((capacity, *value.shape[1:]))
+    return padded.index_copy(0, indices, value), aligned_cu, indices
 
 
 def _packed_layout_indices(cu_seqlens, local_tokens, cp_size, cp_rank):

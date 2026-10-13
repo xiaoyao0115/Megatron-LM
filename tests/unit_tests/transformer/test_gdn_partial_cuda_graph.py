@@ -9,6 +9,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout.graph import (
+    pad_graph_headwise_sequences,
     supports_packed_gdn_graph,
     validate_packed_gdn_graph_inputs,
 )
@@ -105,6 +106,53 @@ def test_partial_gdn_config_accepts_canonical_and_legacy_names(spelling):
     ]
 
 
+def test_partial_headwise_gdn_accepts_cp16_and_rejects_cp32():
+    changes = dict(
+        linear_cp_mode="headwise",
+        cp_partition_mode="zigzag",
+        linear_num_key_heads=16,
+        linear_num_value_heads=64,
+    )
+    config = _config(context_parallel_size=16, **changes)
+    assert supports_packed_gdn_graph(config)
+    validate_packed_gdn_graph_inputs(config, _params(config, 16))
+    with pytest.raises(AssertionError, match="linear_num_key_heads"):
+        _config(context_parallel_size=32, **changes)
+    with pytest.raises(ValueError, match="evenly divide"):
+        validate_packed_gdn_graph_inputs(config, _params(config, 32))
+
+
+@pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
+def test_headwise_graph_accepts_non_chunk_aligned_sequences(size):
+    config = _config(
+        linear_cp_mode="headwise",
+        cp_partition_mode="zigzag",
+        linear_num_key_heads=16,
+        linear_num_value_heads=64,
+    )
+    params = _params(config, size, physical=[0, 130 * size, 384 * size, 512 * size])
+    validate_packed_gdn_graph_inputs(config, params)
+
+
+@pytest.mark.parametrize("boundaries", [[0, 130, 384, 512, 512], [0, 2, 6, 510, 512]])
+def test_headwise_graph_padding_preserves_original_tokens_and_gradients(boundaries):
+    cu = torch.tensor(boundaries, dtype=torch.int32)
+    value = torch.randn(512, 1, 8, requires_grad=True)
+    padded, aligned_cu, indices = pad_graph_headwise_sequences(value, cu)
+    assert padded.shape == (704, 1, 8)
+    assert torch.all(aligned_cu.diff() % 64 == 0)
+    assert aligned_cu[-1] == padded.shape[0]
+    original_pos = torch.arange(value.shape[0])
+    original_seq = torch.searchsorted(cu[1:], original_pos, right=True)
+    padded_seq = torch.searchsorted(aligned_cu[1:], indices, right=True)
+    torch.testing.assert_close(original_seq, padded_seq)
+    torch.testing.assert_close(indices - aligned_cu[padded_seq], original_pos - cu[original_seq])
+    restored = padded.index_select(0, indices)
+    torch.testing.assert_close(restored, value)
+    restored.square().sum().backward()
+    torch.testing.assert_close(value.grad, 2 * value.detach())
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -135,7 +183,7 @@ def _params(config, size, *, valid=None, physical=None):
         )
     return PackedSeqParams(
         qkv_format="thd",
-        cp_partition_mode="contiguous",
+        cp_partition_mode=config.cp_partition_mode,
         local_cp_size=size,
         cp_group=object(),
         **dict(zip(_CU_NAMES, tensors)),
@@ -194,11 +242,22 @@ def test_moe_only_scope_does_not_require_gdn_graph_geometry():
 
 @pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", "1")) != 4, reason="requires four ranks")
 @pytest.mark.parametrize("capture_mode", ["slots", "native", "native_shared_pool"])
-def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode):
+@pytest.mark.parametrize("linear_cp_mode", ["chunkwise", "headwise"])
+def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode, linear_cp_mode):
     shared_slots = capture_mode == "slots"
     with dcp_test_context(monkeypatch, expert_model_parallel_size=4) as groups:
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
-        config = _config(expert_model_parallel_size=4, mtp_num_layers=1)
+        changes = (
+            dict(
+                linear_cp_mode="headwise",
+                cp_partition_mode="zigzag",
+                linear_num_key_heads=4,
+                linear_num_value_heads=8,
+            )
+            if linear_cp_mode == "headwise"
+            else {}
+        )
+        config = _config(expert_model_parallel_size=4, mtp_num_layers=1, **changes)
         spec = get_transformer_block_with_experimental_attention_variant_spec(config)
         mtp_spec = get_gpt_mtp_block_spec(config, spec, use_transformer_engine=True)
         torch.manual_seed(42)
@@ -226,7 +285,12 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode)
         model.zero_grad_buffer = lambda: model.zero_grad(set_to_none=True)
         helper = None
         try:
-            cases = [(size, lengths) for size in (1, 2, 4) for lengths in ((384,), (128, 256))]
+            layouts = (
+                ((384,), (128, 256), (130, 254))
+                if linear_cp_mode == "headwise"
+                else ((384,), (128, 256))
+            )
+            cases = [(size, lengths) for size in (1, 2, 4) for lengths in layouts]
             batches = [
                 dcp_batch(config, groups, size, lengths, index)
                 for index, (size, lengths) in enumerate(cases)
@@ -281,9 +345,21 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode)
 
             copy_span = te_graph._copy_tensor_storage_span
             compact_alpha_copies = []
+            alpha_shapes = {
+                (
+                    (
+                        1,
+                        512 * size + 64 * (config.thd_max_packed_sequences - 1),
+                        config.linear_num_value_heads // size,
+                    )
+                    if linear_cp_mode == "headwise"
+                    else (1, 512, config.linear_num_value_heads)
+                )
+                for size in (1, 2, 4)
+            }
 
             def checked_copy_span(target, source, size_bytes):
-                if source.dtype == torch.bfloat16 and source.shape == (1, 512, 4):
+                if source.dtype == torch.bfloat16 and tuple(source.shape) in alpha_shapes:
                     assert source.is_contiguous()
                     assert size_bytes == source.numel() * source.element_size()
                     compact_alpha_copies.append(size_bytes)
@@ -316,7 +392,9 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode)
             for layer in helper.flattened_callables:
                 assert set(layer.cuda_graphs_by_dynamic_cp_size) == {1, 2, 4}
             replays = track_graph_replays(monkeypatch)
-            for microbatch, index in enumerate((*range(6), *reversed(range(6)), 0)):
+            for microbatch, index in enumerate(
+                (*range(len(cases)), *reversed(range(len(cases))), 0)
+            ):
                 before = len(replays)
                 values, gradients = dcp_train_step(model, batches[index], microbatch, cpu=True)
                 assert len(replays) - before >= 10, "every layer must replay forward AND backward"
@@ -327,7 +405,10 @@ def test_partial_gdn_moe_mtp_dcp_replay_matches_eager(monkeypatch, capture_mode)
                     f"GDN_PARTIAL_REPLAY_PASS rank={torch.distributed.get_rank()} replay={microbatch} case={index}",
                     flush=True,
                 )
-            print("GDN_PARTIAL_PASS layers=4 mtp=1 scope=attn,moe_router,moe_preprocess cp=1,2,4")
+            print(
+                "GDN_PARTIAL_PASS layers=4 mtp=1 scope=attn,moe_router,moe_preprocess "
+                f"cp=1,2,4 linear_cp_mode={linear_cp_mode}"
+            )
         finally:
             torch.cuda.synchronize()
             if helper is not None:
